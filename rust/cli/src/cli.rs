@@ -83,6 +83,10 @@ pub struct CompressCommand {
     #[arg(long = "compression", default_value = "zstd")]
     pub compression: String,
 
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
+
     /// Do not chunk the output file
     #[arg(long = "unchunked", default_value_t = false)]
     pub unchunked: bool,
@@ -262,6 +266,10 @@ pub struct ConvertCommand {
     #[arg(long, value_enum, default_value = "zstd")]
     pub compression: CompressionFormat,
 
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
+
     /// Target uncompressed chunk size in bytes
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     pub chunk_size: u64,
@@ -314,6 +322,10 @@ pub struct MergeCommand {
     /// Chunk compression algorithm for output MCAP
     #[arg(long, value_enum, default_value = "zstd")]
     pub compression: CompressionFormat,
+
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
 
     /// Target uncompressed chunk size in bytes
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
@@ -447,6 +459,10 @@ pub struct FilterCommand {
     #[arg(long = "output-compression", default_value = "zstd")]
     pub output_compression: String,
 
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
+
     /// Target uncompressed chunk size for output
     #[arg(long = "chunk-size", default_value_t = 4 * 1024 * 1024)]
     pub chunk_size: u64,
@@ -484,6 +500,10 @@ pub struct RecoverCommand {
     /// Compression algorithm for output file: zstd, lz4, or none
     #[arg(long = "compression", default_value = "zstd")]
     pub compression: String,
+
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
 }
 
 #[derive(clap::Args, Debug, PartialEq, Eq)]
@@ -498,6 +518,10 @@ pub struct SortCommand {
     /// Chunk compression algorithm for output MCAP: zstd, lz4, or none
     #[arg(long, value_enum, default_value = "zstd")]
     pub compression: CompressionFormat,
+
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
 
     /// Target uncompressed chunk size in bytes
     #[arg(long, default_value_t = 4 * 1024 * 1024)]

@@ -11,6 +11,7 @@ use crate::context::CommandContext;
 #[derive(Debug, Clone)]
 struct SortOptions {
     compression: Option<mcap::Compression>,
+    compression_level: u32,
     chunk_size: u64,
     include_crc: bool,
     chunked: bool,
@@ -47,6 +48,7 @@ fn ensure_distinct_input_output(input: &Path, output: &Path) -> Result<()> {
 fn build_sort_options(args: &SortCommand) -> SortOptions {
     SortOptions {
         compression: convert_compression(args.compression),
+        compression_level: args.compression_level,
         chunk_size: args.chunk_size,
         include_crc: args.include_crc,
         chunked: args.chunked,
@@ -72,6 +74,7 @@ fn sort_to_writer<W: Write + Seek>(
         .use_chunks(opts.chunked)
         .chunk_size(Some(opts.chunk_size))
         .compression(opts.compression)
+        .compression_level(opts.compression_level)
         .calculate_chunk_crcs(opts.include_crc)
         .calculate_data_section_crc(opts.include_crc)
         .calculate_summary_section_crc(opts.include_crc)
@@ -244,6 +247,7 @@ mod tests {
     fn default_sort_options() -> SortOptions {
         SortOptions {
             compression: Some(mcap::Compression::Zstd),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             include_crc: true,
             chunked: true,
@@ -423,6 +427,7 @@ mod tests {
                 file: input_path.clone(),
                 output_file: output_path.clone(),
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 4 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,
@@ -453,6 +458,7 @@ mod tests {
                 file: file_path.clone(),
                 output_file: file_path.clone(),
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 4 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,

@@ -27,6 +27,7 @@ pub fn run(_ctx: &CommandContext, args: ConvertCommand) -> Result<()> {
 
     let opts = build_write_options(
         args.compression,
+        args.compression_level,
         args.chunk_size,
         args.include_crc,
         args.chunked,
@@ -45,6 +46,7 @@ fn validate_input(file_type: InputFileType, input: &mut File) -> Result<()> {
 
 fn build_write_options(
     compression: CompressionFormat,
+    compression_level: u32,
     chunk_size: u64,
     include_crc: bool,
     chunked: bool,
@@ -60,6 +62,7 @@ fn build_write_options(
         .use_chunks(chunked)
         .chunk_size(Some(chunk_size))
         .compression(compression)
+        .compression_level(compression_level)
         .calculate_chunk_crcs(include_crc)
         .calculate_data_section_crc(include_crc)
         .calculate_summary_section_crc(include_crc)
@@ -94,7 +97,7 @@ mod tests {
 
     fn build_sample_mcap(include_crc: bool) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());
-        let opts = build_write_options(CompressionFormat::None, 1024, include_crc, true);
+        let opts = build_write_options(CompressionFormat::None, 0, 1024, include_crc, true);
         {
             let mut writer = opts.create(&mut output).expect("writer");
             let schema_id = writer

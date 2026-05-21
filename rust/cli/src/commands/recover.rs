@@ -11,6 +11,7 @@ use crate::context::CommandContext;
 #[derive(Debug, Clone)]
 struct RecoverOptions {
     compression: Option<mcap::Compression>,
+    compression_level: u32,
     chunk_size: u64,
     always_decode_chunk: bool,
 }
@@ -42,6 +43,7 @@ struct RecoveryState {
 pub fn run(_ctx: &CommandContext, args: RecoverCommand) -> Result<()> {
     let opts = RecoverOptions {
         compression: crate::commands::common::parse_output_compression(&args.compression)?,
+        compression_level: args.compression_level,
         chunk_size: args.chunk_size,
         always_decode_chunk: args.always_decode_chunk,
     };
@@ -82,6 +84,7 @@ fn recover_to_sink<W: Write + Seek>(
     let mut write_options = mcap::WriteOptions::new()
         .chunk_size(Some(opts.chunk_size))
         .compression(opts.compression)
+        .compression_level(opts.compression_level)
         .disable_seeking(disable_seeking);
 
     if let Some(header) = sniff_header(input) {
@@ -452,6 +455,7 @@ mod tests {
     fn default_options() -> RecoverOptions {
         RecoverOptions {
             compression: Some(mcap::Compression::Zstd),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             always_decode_chunk: false,
         }

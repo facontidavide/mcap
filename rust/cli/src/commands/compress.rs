@@ -10,6 +10,7 @@ pub fn run(_ctx: &CommandContext, args: CompressCommand) -> Result<()> {
     // so these settings are effectively ignored by the writer.
     let options = TranscodeCommandOptions::new(args.file, args.output, args.chunk_size)
         .compression(args.compression)
+        .compression_level(args.compression_level)
         .use_chunks(!args.unchunked)
         .include_metadata(true)
         .include_attachments(true);

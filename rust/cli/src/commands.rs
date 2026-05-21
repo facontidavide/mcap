@@ -226,6 +226,7 @@ mod tests {
                 always_decode_chunk: false,
                 chunk_size: 4 * 1024 * 1024,
                 compression: "zstd".to_string(),
+                compression_level: 0,
             }),
         )
         .expect_err("recover should fail on missing file");
@@ -241,6 +242,7 @@ mod tests {
                 output: None,
                 chunk_size: 4 * 1024 * 1024,
                 compression: "invalid".to_string(),
+                compression_level: 0,
                 unchunked: false,
             }),
         )
@@ -257,6 +259,7 @@ mod tests {
                 output_file: PathBuf::from("sorted.mcap"),
                 chunk_size: 4 * 1024 * 1024,
                 compression: crate::cli::CompressionFormat::Zstd,
+                compression_level: 0,
                 include_crc: true,
                 chunked: true,
             }),

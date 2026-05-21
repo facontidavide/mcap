@@ -299,6 +299,7 @@ mod tests {
                 input: "input.bag".into(),
                 output: "output.mcap".into(),
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 8 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,
@@ -315,6 +316,8 @@ mod tests {
             "output.mcap",
             "--compression",
             "none",
+            "--compression-level",
+            "9",
             "--chunk-size",
             "1024",
             "--include-crc=false",
@@ -327,6 +330,7 @@ mod tests {
                 input: "input.bag".into(),
                 output: "output.mcap".into(),
                 compression: CompressionFormat::None,
+                compression_level: 9,
                 chunk_size: 1024,
                 include_crc: false,
                 chunked: false,
@@ -351,6 +355,7 @@ mod tests {
                 input: "input.bag".into(),
                 output: "output.mcap".into(),
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 8 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,
@@ -410,6 +415,7 @@ mod tests {
                 output: None,
                 chunk_size: 4 * 1024 * 1024,
                 compression: "zstd".to_string(),
+                compression_level: 0,
                 unchunked: false,
             })
         );
@@ -427,6 +433,8 @@ mod tests {
             "1024",
             "--compression",
             "lz4",
+            "--compression-level",
+            "4",
             "--unchunked",
         ])
         .expect("compress with flags should parse");
@@ -437,6 +445,7 @@ mod tests {
                 output: Some("out.mcap".into()),
                 chunk_size: 1024,
                 compression: "lz4".to_string(),
+                compression_level: 4,
                 unchunked: true,
             })
         );
@@ -498,6 +507,8 @@ mod tests {
             "--include-attachments",
             "--output-compression",
             "lz4",
+            "--compression-level",
+            "4",
             "--chunk-size",
             "2048",
         ])
@@ -519,6 +530,7 @@ mod tests {
                 include_metadata: true,
                 include_attachments: true,
                 output_compression: "lz4".to_string(),
+                compression_level: 4,
                 chunk_size: 2048,
             })
         );
@@ -536,6 +548,7 @@ mod tests {
                 always_decode_chunk: false,
                 chunk_size: 4 * 1024 * 1024,
                 compression: "zstd".to_string(),
+                compression_level: 0,
             })
         );
     }
@@ -551,6 +564,7 @@ mod tests {
                 output_file: "out.mcap".into(),
                 chunk_size: 4 * 1024 * 1024,
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 include_crc: true,
                 chunked: true,
             })
@@ -570,6 +584,8 @@ mod tests {
             "2048",
             "--compression",
             "none",
+            "--compression-level",
+            "9",
         ])
         .expect("recover with flags should parse");
         assert_eq!(
@@ -580,6 +596,7 @@ mod tests {
                 always_decode_chunk: true,
                 chunk_size: 2048,
                 compression: "none".to_string(),
+                compression_level: 9,
             })
         );
     }
@@ -594,6 +611,8 @@ mod tests {
             "out.mcap",
             "--compression",
             "none",
+            "--compression-level",
+            "9",
             "--chunk-size",
             "1024",
             "--include-crc=false",
@@ -607,6 +626,7 @@ mod tests {
                 output_file: "out.mcap".into(),
                 chunk_size: 1024,
                 compression: CompressionFormat::None,
+                compression_level: 9,
                 include_crc: false,
                 chunked: false,
             })
@@ -632,6 +652,7 @@ mod tests {
                 output_file: "out.mcap".into(),
                 chunk_size: 4 * 1024 * 1024,
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 include_crc: true,
                 chunked: true,
             })
@@ -664,6 +685,7 @@ mod tests {
                 files: vec!["a.mcap".into(), "b.mcap".into()],
                 output_file: None,
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 8 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,
@@ -684,6 +706,8 @@ mod tests {
             "out.mcap",
             "--compression",
             "none",
+            "--compression-level",
+            "9",
             "--chunk-size",
             "2048",
             "--include-crc=false",
@@ -699,6 +723,7 @@ mod tests {
                 files: vec!["a.mcap".into(), "b.mcap".into()],
                 output_file: Some("out.mcap".into()),
                 compression: CompressionFormat::None,
+                compression_level: 9,
                 chunk_size: 2048,
                 include_crc: false,
                 chunked: false,
@@ -725,6 +750,7 @@ mod tests {
                 files: vec!["a.mcap".into(), "b.mcap".into()],
                 output_file: None,
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 8 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,
@@ -758,6 +784,7 @@ mod tests {
                 ],
                 output_file: None,
                 compression: CompressionFormat::Zstd,
+                compression_level: 0,
                 chunk_size: 8 * 1024 * 1024,
                 include_crc: true,
                 chunked: true,

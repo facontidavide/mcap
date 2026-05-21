@@ -23,6 +23,7 @@ struct FilterOptions {
     include_metadata: bool,
     include_attachments: bool,
     compression: Option<mcap::Compression>,
+    compression_level: u32,
     chunk_size: u64,
     use_chunks: bool,
 }
@@ -43,6 +44,7 @@ pub(crate) struct TranscodeCommandOptions {
     pub(crate) include_metadata: bool,
     pub(crate) include_attachments: bool,
     pub(crate) output_compression: String,
+    pub(crate) compression_level: u32,
     pub(crate) chunk_size: u64,
     pub(crate) use_chunks: bool,
 }
@@ -64,6 +66,7 @@ impl From<&FilterCommand> for TranscodeCommandOptions {
             include_metadata: args.include_metadata,
             include_attachments: args.include_attachments,
             output_compression: args.output_compression.clone(),
+            compression_level: args.compression_level,
             chunk_size: args.chunk_size,
             use_chunks: true,
         }
@@ -87,6 +90,7 @@ impl TranscodeCommandOptions {
             include_metadata: false,
             include_attachments: false,
             output_compression: "zstd".to_string(),
+            compression_level: 0,
             chunk_size,
             use_chunks: true,
         }
@@ -94,6 +98,11 @@ impl TranscodeCommandOptions {
 
     pub(crate) fn compression(mut self, value: impl Into<String>) -> Self {
         self.output_compression = value.into();
+        self
+    }
+
+    pub(crate) fn compression_level(mut self, value: u32) -> Self {
+        self.compression_level = value;
         self
     }
 
@@ -180,6 +189,7 @@ fn build_filter_options_from_transcode_options(
         include_metadata: args.include_metadata,
         include_attachments: args.include_attachments,
         compression: common::parse_output_compression(&args.output_compression)?,
+        compression_level: args.compression_level,
         chunk_size: args.chunk_size,
         use_chunks: args.use_chunks,
     })
@@ -245,6 +255,7 @@ fn filter_to_writer<W: Write + Seek>(
         .use_chunks(opts.use_chunks)
         .chunk_size(Some(opts.chunk_size))
         .compression(opts.compression)
+        .compression_level(opts.compression_level)
         .disable_seeking(disable_seeking);
 
     if let Some(header) = read_header(input)? {
@@ -584,6 +595,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             output_compression: "zstd".to_string(),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
         }
     }
@@ -746,6 +758,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             compression: Some(mcap::Compression::Zstd),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -790,6 +803,7 @@ mod tests {
             include_metadata: true,
             include_attachments: true,
             compression: Some(mcap::Compression::Lz4),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -815,6 +829,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             compression: Some(mcap::Compression::Lz4),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -838,6 +853,7 @@ mod tests {
             include_metadata: false,
             include_attachments: true,
             compression: Some(mcap::Compression::Lz4),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -863,6 +879,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             compression: Some(mcap::Compression::Zstd),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -889,6 +906,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             compression: Some(mcap::Compression::Zstd),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };
@@ -913,6 +931,7 @@ mod tests {
             include_metadata: false,
             include_attachments: false,
             compression: Some(mcap::Compression::Lz4),
+            compression_level: 0,
             chunk_size: 4 * 1024 * 1024,
             use_chunks: true,
         };

@@ -408,6 +408,8 @@ pub struct Writer<W: Write + Seek> {
     writer: Option<WriteMode<W>>,
     finished_summary: Option<Summary>,
     chunk_mode: ChunkMode,
+    #[cfg(feature = "zstd")]
+    zstd_encoder: Option<zraw::Encoder<'static>>,
     options: WriteOptions,
     // Maps all unique channel content to its "canonical" or first written ID.
     canonical_channels: BiHashMap<ChannelContent<'static>, u16>,
@@ -470,6 +472,8 @@ impl<W: Write + Seek> Writer<W> {
             finished_summary: None,
             options: opts,
             chunk_mode,
+            #[cfg(feature = "zstd")]
+            zstd_encoder: None,
             canonical_schemas: Default::default(),
             canonical_channels: Default::default(),
             all_channel_ids: Default::default(),
@@ -1105,16 +1109,26 @@ impl<W: Write + Seek> Writer<W> {
         self.writer = Some(match self.writer.take().expect(Self::WRITER_IS_NONE) {
             WriteMode::Raw(w) => {
                 // It's chunkin time.
+                #[cfg(feature = "zstd")]
+                let zstd_encoder = if matches!(self.options.compression, Some(Compression::Zstd)) {
+                    self.zstd_encoder.take()
+                } else {
+                    None
+                };
                 WriteMode::Chunk(ChunkWriter::new(
                     w,
-                    self.options.compression,
                     std::mem::take(&mut self.chunk_mode),
                     self.options.emit_message_indexes,
                     self.options.calculate_chunk_crcs,
-                    #[cfg(any(feature = "zstd", feature = "lz4"))]
-                    self.options.compression_level,
-                    #[cfg(feature = "zstd")]
-                    self.options.compression_threads,
+                    ChunkCompressionOptions {
+                        compression: self.options.compression,
+                        #[cfg(any(feature = "zstd", feature = "lz4"))]
+                        compression_level: self.options.compression_level,
+                        #[cfg(feature = "zstd")]
+                        compression_threads: self.options.compression_threads,
+                        #[cfg(feature = "zstd")]
+                        zstd_encoder,
+                    },
                 )?)
             }
             chunk => chunk,
@@ -1142,10 +1156,14 @@ impl<W: Write + Seek> Writer<W> {
         // See start_chunk() for why we use take() here.
         match self.writer.take().expect(Self::WRITER_IS_NONE) {
             WriteMode::Chunk(c) => match c.finish() {
-                Ok((w, mode, index)) => {
-                    self.chunk_indexes.push(index);
-                    self.chunk_mode = mode;
-                    self.writer = Some(WriteMode::Raw(w))
+                Ok(finished_chunk) => {
+                    self.chunk_indexes.push(finished_chunk.index);
+                    self.chunk_mode = finished_chunk.mode;
+                    #[cfg(feature = "zstd")]
+                    {
+                        self.zstd_encoder = finished_chunk.zstd_encoder;
+                    }
+                    self.writer = Some(WriteMode::Raw(finished_chunk.writer))
                 }
                 Err((w, err)) => {
                     self.writer = Some(WriteMode::Failed(w));
@@ -1468,17 +1486,42 @@ enum Compressor<W: Write> {
     Lz4(lz4::Encoder<W>),
 }
 
+struct FinishedCompressor<W> {
+    writer: W,
+    result: std::io::Result<()>,
+    #[cfg(feature = "zstd")]
+    zstd_encoder: Option<zraw::Encoder<'static>>,
+}
+
 impl<W: Write> Compressor<W> {
-    fn finish(self) -> (W, std::io::Result<()>) {
+    fn finish(self) -> FinishedCompressor<W> {
         match self {
-            Compressor::Null(w) => (w, Ok(())),
+            Compressor::Null(w) => FinishedCompressor {
+                writer: w,
+                result: Ok(()),
+                #[cfg(feature = "zstd")]
+                zstd_encoder: None,
+            },
             #[cfg(feature = "zstd")]
             Compressor::Zstd(mut w) => {
                 let result = w.finish();
-                (w.into_inner().0, result)
+                let (writer, zstd_encoder) = w.into_inner();
+                FinishedCompressor {
+                    writer,
+                    result,
+                    zstd_encoder: Some(zstd_encoder),
+                }
             }
             #[cfg(feature = "lz4")]
-            Compressor::Lz4(w) => w.finish(),
+            Compressor::Lz4(w) => {
+                let (writer, result) = w.finish();
+                FinishedCompressor {
+                    writer,
+                    result,
+                    #[cfg(feature = "zstd")]
+                    zstd_encoder: None,
+                }
+            }
         }
     }
 
@@ -1515,6 +1558,16 @@ impl<W: Write> Write for Compressor<W> {
     }
 }
 
+struct ChunkCompressionOptions {
+    compression: Option<Compression>,
+    #[cfg(any(feature = "zstd", feature = "lz4"))]
+    compression_level: u32,
+    #[cfg(feature = "zstd")]
+    compression_threads: u32,
+    #[cfg(feature = "zstd")]
+    zstd_encoder: Option<zraw::Encoder<'static>>,
+}
+
 struct ChunkWriter<W: Write> {
     chunk_offset: u64,
     header_start: u64,
@@ -1532,15 +1585,21 @@ struct ChunkWriter<W: Write> {
     emit_message_indexes: bool,
 }
 
+struct FinishedChunk<W: Write> {
+    writer: CountingCrcWriter<W>,
+    mode: ChunkMode,
+    index: records::ChunkIndex,
+    #[cfg(feature = "zstd")]
+    zstd_encoder: Option<zraw::Encoder<'static>>,
+}
+
 impl<W: Write + Seek> ChunkWriter<W> {
     fn new(
         mut writer: CountingCrcWriter<W>,
-        compression: Option<Compression>,
         mode: ChunkMode,
         emit_message_indexes: bool,
         calculate_chunk_crcs: bool,
-        #[cfg(any(feature = "zstd", feature = "lz4"))] compression_level: u32,
-        #[cfg(feature = "zstd")] compression_threads: u32,
+        compression_options: ChunkCompressionOptions,
     ) -> McapResult<Self> {
         // Relative to start of original stream.
         let chunk_offset = writer.stream_position()?;
@@ -1553,7 +1612,7 @@ impl<W: Write + Seek> ChunkWriter<W> {
 
         op_and_len(&mut sink, op::CHUNK, !0)?;
 
-        let compression_name = match compression {
+        let compression_name = match compression_options.compression {
             #[cfg(feature = "zstd")]
             Some(Compression::Zstd) => "zstd",
             #[cfg(feature = "lz4")]
@@ -1577,14 +1636,25 @@ impl<W: Write + Seek> ChunkWriter<W> {
         let data_start = sink.stream_position()?;
         let sink = CountingCrcWriter::new(sink, calculate_chunk_crcs);
 
-        let compressor = match compression {
+        let compressor = match compression_options.compression {
             #[cfg(feature = "zstd")]
             Some(Compression::Zstd) => {
                 #[allow(unused_mut)]
-                let mut enc = zraw::Encoder::with_dictionary(compression_level as i32, &[])?;
-                // Enable multithreaded encoding on non-WASM targets.
-                #[cfg(not(target_arch = "wasm32"))]
-                enc.set_parameter(zraw::CParameter::NbWorkers(compression_threads))?;
+                let mut enc = if let Some(mut enc) = compression_options.zstd_encoder {
+                    zraw::Operation::reinit(&mut enc)?;
+                    enc
+                } else {
+                    let mut enc = zraw::Encoder::with_dictionary(
+                        compression_options.compression_level as i32,
+                        &[],
+                    )?;
+                    // Enable multithreaded encoding on non-WASM targets.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    enc.set_parameter(zraw::CParameter::NbWorkers(
+                        compression_options.compression_threads,
+                    ))?;
+                    enc
+                };
 
                 Compressor::Zstd(zio::Writer::new(sink, enc))
             }
@@ -1594,11 +1664,11 @@ impl<W: Write + Seek> ChunkWriter<W> {
                 // (github.com/lz4/lz4/pull/1336), but this is not yet
                 // available through the lz4 / lz4-sys crates.
                 lz4::EncoderBuilder::new()
-                    .level(compression_level)
                     // Disable the block checksum for wider compatibility with MCAP tooling that
                     // includes a fault block checksum calculation. Since the MCAP spec includes a
                     // CRC for the compressed chunk this would be a superfluous check anyway.
                     .block_checksum(lz4::liblz4::BlockChecksum::NoBlockChecksum)
+                    .level(compression_options.compression_level)
                     .build(sink)?,
             ),
             #[cfg(not(any(feature = "zstd", feature = "lz4")))]
@@ -1650,9 +1720,7 @@ impl<W: Write + Seek> ChunkWriter<W> {
         Ok(())
     }
 
-    fn finish(
-        self,
-    ) -> Result<(CountingCrcWriter<W>, ChunkMode, records::ChunkIndex), (W, McapError)> {
+    fn finish(self) -> Result<FinishedChunk<W>, (W, McapError)> {
         // Get the number of uncompressed bytes written and the CRC.
         fn unwrap_writer<W>(writer: CountingCrcWriter<ChunkSink<W>>) -> W {
             writer.finalize().0.inner
@@ -1662,7 +1730,12 @@ impl<W: Write + Seek> ChunkWriter<W> {
         let (stream, uncompressed_crc) = self.compressor.finalize();
 
         // Finalize the compression stream - it maintains an internal buffer.
-        let (writer, result) = stream.finish();
+        let FinishedCompressor {
+            writer,
+            result,
+            #[cfg(feature = "zstd")]
+            zstd_encoder,
+        } = stream.finish();
 
         if let Err(err) = result {
             return Err((unwrap_writer(writer), err.into()));
@@ -1779,7 +1852,13 @@ impl<W: Write + Seek> ChunkWriter<W> {
             uncompressed_size: header.uncompressed_size,
         };
 
-        Ok((writer, mode, index))
+        Ok(FinishedChunk {
+            writer,
+            mode,
+            index,
+            #[cfg(feature = "zstd")]
+            zstd_encoder,
+        })
     }
 }
 
@@ -1891,7 +1970,7 @@ mod tests {
     use assert_matches::assert_matches;
     use std::sync::Arc;
 
-    use crate::read::LinearReader;
+    use crate::read::{LinearReader, RawMessageStream};
 
     use super::*;
     #[test]
@@ -2041,6 +2120,52 @@ mod tests {
         assert!(summary.attachment_indexes.is_empty());
         assert!(summary.metadata_indexes.is_empty());
         assert_eq!(summary.chunk_indexes.len(), 1);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn writes_multiple_zstd_chunks_with_reused_encoder() {
+        let file = std::io::Cursor::new(Vec::new());
+        let mut writer = WriteOptions::new()
+            .compression(Some(Compression::Zstd))
+            .compression_threads(1)
+            .chunk_size(Some(64))
+            .create(file)
+            .expect("failed to construct writer");
+        let channel = Arc::new(crate::Channel {
+            id: 1,
+            topic: "chat".into(),
+            message_encoding: "json".into(),
+            metadata: BTreeMap::new(),
+            schema: None,
+        });
+
+        for i in 0..4 {
+            let data = vec![i as u8; 128];
+            writer
+                .write(&crate::Message {
+                    channel: channel.clone(),
+                    sequence: i as u32,
+                    log_time: i as u64,
+                    publish_time: i as u64,
+                    data: Cow::Owned(data),
+                })
+                .expect("could not write message");
+        }
+
+        let summary = writer.finish().expect("failed to finish");
+        assert!(summary.chunk_indexes.len() > 1);
+
+        let output = writer.into_inner().into_inner();
+        let messages: McapResult<Vec<_>> = RawMessageStream::new(&output)
+            .expect("failed to construct reader")
+            .collect();
+        let messages = messages.expect("failed to read messages");
+        assert_eq!(messages.len(), 4);
+        for (i, message) in messages.iter().enumerate() {
+            assert_eq!(message.header.sequence, i as u32);
+            assert_eq!(&message.data[..], vec![i as u8; 128]);
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ struct MergeOptions {
     files: Vec<PathBuf>,
     output_file: Option<PathBuf>,
     compression: Option<mcap::Compression>,
+    compression_level: u32,
     chunk_size: u64,
     include_crc: bool,
     chunked: bool,
@@ -155,6 +156,7 @@ fn build_merge_options(args: MergeCommand) -> MergeOptions {
         files: args.files,
         output_file: args.output_file,
         compression,
+        compression_level: args.compression_level,
         chunk_size: args.chunk_size,
         include_crc: args.include_crc,
         chunked: args.chunked,
@@ -180,6 +182,7 @@ fn merge_inputs<W: Write + Seek>(
         .use_chunks(opts.chunked)
         .chunk_size(Some(opts.chunk_size))
         .compression(opts.compression)
+        .compression_level(opts.compression_level)
         .calculate_chunk_crcs(opts.include_crc)
         .calculate_data_section_crc(opts.include_crc)
         .calculate_summary_section_crc(opts.include_crc)
@@ -747,6 +750,7 @@ mod tests {
             files: Vec::new(),
             output_file: None,
             compression: None,
+            compression_level: 0,
             chunk_size: 1024,
             include_crc: true,
             chunked: true,
@@ -769,6 +773,7 @@ mod tests {
             files: vec!["a.mcap".into(), "b.mcap".into()],
             output_file: Some("out.mcap".into()),
             compression: CompressionFormat::Lz4,
+            compression_level: 7,
             chunk_size: 4096,
             include_crc: false,
             chunked: false,
@@ -782,6 +787,7 @@ mod tests {
         );
         assert_eq!(options.output_file, Some(PathBuf::from("out.mcap")));
         assert!(matches!(options.compression, Some(mcap::Compression::Lz4)));
+        assert_eq!(options.compression_level, 7);
         assert_eq!(options.chunk_size, 4096);
         assert!(!options.include_crc);
         assert!(!options.chunked);

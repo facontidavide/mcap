@@ -40,8 +40,8 @@ mod tests {
         DecompressCommand, DoctorCommand, DuCommand, FilterCommand, GetAttachmentCommand,
         GetCommand, GetMetadataCommand, GetSubcommand, InfoCommand, ListAttachmentsCommand,
         ListChannelsCommand, ListChunksCommand, ListCommand, ListMetadataCommand,
-        ListSchemasCommand, ListSubcommand, MergeCommand, RecoverCommand, SortCommand,
-        VersionCommand,
+        ListSchemasCommand, ListSubcommand, MergeCommand, RecoverCommand, RepackageCommand,
+        SortCommand, VersionCommand,
     };
 
     #[test]
@@ -567,6 +567,61 @@ mod tests {
                 compression_level: 0,
                 include_crc: true,
                 chunked: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_repackage_with_defaults() {
+        let args = Args::try_parse_from(["mcap", "repackage", "in.mcap", "-o", "out.mcap"])
+            .expect("repackage should parse");
+        assert_eq!(
+            args.command,
+            Command::Repackage(RepackageCommand {
+                file: "in.mcap".into(),
+                output_file: "out.mcap".into(),
+                window_duration_secs: 1,
+                large_message_threshold: 256 * 1024,
+                chunk_size: 4 * 1024 * 1024,
+                compression: CompressionFormat::Zstd,
+                compression_level: 0,
+                include_crc: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_repackage_with_all_flags() {
+        let args = Args::try_parse_from([
+            "mcap",
+            "repackage",
+            "in.mcap",
+            "-o",
+            "out.mcap",
+            "--window-duration-secs",
+            "5",
+            "--large-message-threshold",
+            "1024",
+            "--compression",
+            "none",
+            "--compression-level",
+            "9",
+            "--chunk-size",
+            "2048",
+            "--include-crc=false",
+        ])
+        .expect("repackage with flags should parse");
+        assert_eq!(
+            args.command,
+            Command::Repackage(RepackageCommand {
+                file: "in.mcap".into(),
+                output_file: "out.mcap".into(),
+                window_duration_secs: 5,
+                large_message_threshold: 1024,
+                chunk_size: 2048,
+                compression: CompressionFormat::None,
+                compression_level: 9,
+                include_crc: false,
             })
         );
     }

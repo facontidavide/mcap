@@ -59,6 +59,7 @@ Run `mcap --help` for detailed usage information.
     list        List records of an MCAP file
     merge       Merge a selection of MCAP files by record timestamp
     recover     Recover data from a potentially corrupt MCAP file
+    repackage   Rewrite chunk layout for faster lazy topic access
     version     Output version information
 
     Flags:
@@ -134,6 +135,32 @@ Echo messages for a specific topic to stdout as JSON:
     {"topic":"/tf","sequence":20,"log_time":1490149580.175192697,"publish_time":1490149580.175192697,"data":{"transforms":[{"header":{"seq":0,"stamp":1490149580.187523449,"frame_id":"base_link"},"child_frame_id":"radar","transform":{"translation":{"x":3.835,"y":0,"z":0},"rotation":{"x":0,"y":0,"z":0,"w":1}}}]}}
     {"topic":"/tf","sequence":21,"log_time":1490149580.185428613,"publish_time":1490149580.185428613,"data":{"transforms":[{"header":{"seq":0,"stamp":1490149580.197612248,"frame_id":"base_link"},"child_frame_id":"radar","transform":{"translation":{"x":3.835,"y":0,"z":0},"rotation":{"x":0,"y":0,"z":0,"w":1}}}]}}
     {"topic":"/tf","sequence":22,"log_time":1490149580.196638030,"publish_time":1490149580.196638030,"data":{"transforms":[{"header":{"seq":0,"stamp":1490149580.207699065,"frame_id":"base_link"},"child_frame_id":"radar","transform":{"translation":{"x":3.835,"y":0,"z":0},"rotation":{"x":0,"y":0,"z":0,"w":1}}}]}}
+
+### Repackage chunk layout
+
+For files with small topics interleaved with very large messages, reading only the
+small topics can still require decompressing chunks that contain unrelated large
+message data. The `repackage` command rewrites the physical chunk layout so that
+messages are grouped by topic inside short log-time windows:
+
+    $ mcap repackage input.mcap -o repackaged.mcap
+
+By default, `repackage` uses 1 second windows, writes messages with payloads of
+256 KiB or larger as single-message chunks, and writes zstd-compressed output.
+The compression format, compression level, chunk size, window duration, and large
+message threshold can be adjusted:
+
+    $ mcap repackage input.mcap -o repackaged.mcap \
+        --window-duration-secs 5 \
+        --large-message-threshold 524288 \
+        --compression zstd \
+        --compression-level 0
+
+This can make lazy reads of small topics faster because fewer unrelated large
+messages share the chunks that need to be decompressed. The command preserves
+message contents and indexed read access by log time, but it changes physical
+chunk order: tools that scan the file linearly will see topic-grouped chunks
+within each time window.
 
 ### Remote file support
 

@@ -60,6 +60,8 @@ pub enum Command {
     Merge(MergeCommand),
     /// Recover data from a potentially corrupt MCAP file
     Recover(RecoverCommand),
+    /// Rewrite chunk layout to improve lazy topic reads
+    Repackage(RepackageCommand),
     /// Read an MCAP file and write messages sorted by log time
     Sort(SortCommand),
     /// Output version information
@@ -504,6 +506,49 @@ pub struct RecoverCommand {
     /// Compression level for output chunks. 0 uses the compressor default.
     #[arg(long = "compression-level", default_value_t = 0)]
     pub compression_level: u32,
+}
+
+#[derive(clap::Args, Debug, PartialEq, Eq)]
+pub struct RepackageCommand {
+    /// Local path to the source MCAP file
+    pub file: PathBuf,
+
+    /// Local path for the destination repackaged MCAP file
+    #[arg(short = 'o', long = "output", alias = "output-file")]
+    pub output_file: PathBuf,
+
+    /// Log-time window duration in seconds. Messages are grouped by topic within each window.
+    #[arg(long = "window-duration-secs", default_value_t = 1)]
+    pub window_duration_secs: u64,
+
+    /// Messages at or above this data size are written as single-message chunks.
+    #[arg(long = "large-message-threshold", default_value_t = 256 * 1024)]
+    pub large_message_threshold: u64,
+
+    /// Target uncompressed chunk size in bytes for small-message groups.
+    #[arg(long = "chunk-size", default_value_t = 4 * 1024 * 1024)]
+    pub chunk_size: u64,
+
+    /// Chunk compression algorithm for output MCAP: zstd, lz4, or none
+    #[arg(long, value_enum, default_value = "zstd")]
+    pub compression: CompressionFormat,
+
+    /// Compression level for output chunks. 0 uses the compressor default.
+    #[arg(long = "compression-level", default_value_t = 0)]
+    pub compression_level: u32,
+
+    /// Include chunk CRC checksums in output MCAP.
+    ///
+    /// Accepts bare `--include-crc` and explicit `--include-crc=<bool>`.
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
+    pub include_crc: bool,
 }
 
 #[derive(clap::Args, Debug, PartialEq, Eq)]

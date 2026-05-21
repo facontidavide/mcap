@@ -59,7 +59,7 @@ export const cases: CliTestCase[] = [
     invocation: { args: ["--help"] },
     comparison: {
       exitCode: 0,
-      stdout: { kind: "command-list", ignoreCommands: ["completion"] },
+      stdout: { kind: "command-list", ignoreCommands: ["completion", "repackage"] },
       stderr: { kind: "text" },
     },
   },
@@ -434,6 +434,29 @@ export const cases: CliTestCase[] = [
       rustBehavior: {
         exitCode: "nonzero",
         stderr: { kind: "contains", value: "unrecognized" },
+      },
+    },
+  },
+  {
+    id: "known-difference-repackage-command",
+    description: "Rust CLI exposes repackage; Go CLI does not.",
+    tags: ["known-difference", "repackage"],
+    invocation: {
+      args: ["repackage", TEN_MESSAGES, "-o", "repackaged.mcap", "--compression", "none"],
+    },
+    knownDifference: {
+      id: "repackage-command",
+      summary: "Rust CLI exposes a repackage command; Go CLI currently has no matching command.",
+      reason: "The new layout-oriented rewrite feature is implemented only in the Rust CLI.",
+      desiredBehavior:
+        "If Go CLI parity remains required, Go should grow an equivalent repackage command or the command should be documented as Rust-only.",
+      goBehavior: {
+        exitCode: "nonzero",
+        stderr: { kind: "contains", value: "unknown command" },
+      },
+      rustBehavior: {
+        exitCode: 0,
+        files: [{ path: "repackaged.mcap", exists: true }],
       },
     },
   },

@@ -23,6 +23,7 @@ Status legend: 🟢 implemented, 🟡 partial, 🔴 not implemented.
 | `list`       | 🟢     |                                                                                                                                           |
 | `merge`      | 🟢     |                                                                                                                                           |
 | `recover`    | 🟡     | Best-effort recovery is implemented for messages, attachments, and metadata; Go-parity gaps remain around raw chunk passthrough behavior. |
+| `repackage`  | 🟢     | Rewrites chunk layout into topic-contiguous chunks within log-time windows for faster lazy topic access.                                  |
 | `sort`       | 🟢     |                                                                                                                                           |
 | `version`    | 🟢     |                                                                                                                                           |
 

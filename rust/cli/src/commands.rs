@@ -19,6 +19,7 @@ mod list_metadata;
 mod list_schemas;
 mod merge;
 mod recover;
+mod repackage;
 mod sort;
 mod version;
 
@@ -57,6 +58,7 @@ pub fn dispatch(ctx: &CommandContext, command: Command) -> Result<()> {
         Command::Filter(args) => filter::run(ctx, args),
         Command::Merge(args) => merge::run(ctx, args),
         Command::Recover(args) => recover::run(ctx, args),
+        Command::Repackage(args) => repackage::run(ctx, args),
         Command::Sort(args) => sort::run(ctx, args),
     }
 }
@@ -70,7 +72,8 @@ mod tests {
         AddAttachmentCommand, AddCommand, AddMetadataCommand, AddSubcommand, Command,
         CompressCommand, DoctorCommand, DuCommand, GetAttachmentCommand, GetMetadataCommand,
         InfoCommand, ListAttachmentsCommand, ListChannelsCommand, ListChunksCommand, ListCommand,
-        ListMetadataCommand, ListSchemasCommand, ListSubcommand, RecoverCommand, SortCommand,
+        ListMetadataCommand, ListSchemasCommand, ListSubcommand, RecoverCommand, RepackageCommand,
+        SortCommand,
     };
     use crate::context::CommandContext;
 
@@ -265,6 +268,28 @@ mod tests {
             }),
         )
         .expect_err("sort should fail on missing input file");
+        assert!(
+            err.to_string().contains("couldn't open")
+                || err.to_string().contains("failed to canonicalize input")
+        );
+    }
+
+    #[test]
+    fn repackage_requires_existing_file() {
+        let err = dispatch(
+            &CommandContext::default(),
+            Command::Repackage(RepackageCommand {
+                file: PathBuf::from("does-not-exist.mcap"),
+                output_file: PathBuf::from("repackaged.mcap"),
+                window_duration_secs: 1,
+                large_message_threshold: 256 * 1024,
+                chunk_size: 4 * 1024 * 1024,
+                compression: crate::cli::CompressionFormat::Zstd,
+                compression_level: 0,
+                include_crc: true,
+            }),
+        )
+        .expect_err("repackage should fail on missing input file");
         assert!(
             err.to_string().contains("couldn't open")
                 || err.to_string().contains("failed to canonicalize input")

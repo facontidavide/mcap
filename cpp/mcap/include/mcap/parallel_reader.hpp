@@ -42,6 +42,7 @@
 #include <new>
 #include <optional>
 #include <queue>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -92,7 +93,11 @@ struct NoInitAllocator {
   }
   template <class U>
   void construct(U* p) noexcept {
-    ::new (static_cast<void*>(p)) U;  // default-init: leaves std::byte uninitialized
+    // Guard against accidental rebind to a non-trivial type: default-init
+    // would call its default ctor and we'd lose the no-init semantics that
+    // exist only to skip zeroing decompression buffers.
+    static_assert(std::is_trivial_v<U>, "NoInitAllocator is safe only for trivial element types");
+    ::new (static_cast<void*>(p)) U;  // default-init: leaves bytes uninitialized
   }
 };
 template <class A, class B>
@@ -251,6 +256,28 @@ public:
     }
     pointer operator->() const {
       return &*view_->curView_;
+    }
+
+    // Opaque, non-owning handle to the buffer that backs the current message's
+    // bytes (`(*it).message.data` points inside it). Advanced/optional: most
+    // consumers read `message.data` directly during iteration and never call
+    // this. It exists for consumers that want to *defer* reading a message:
+    // lock() succeeds while the iterator is positioned on this message (the
+    // bytes are alive), and returns empty after operator++ or after the
+    // ParallelReader is destroyed (the bytes are gone — re-read from the file).
+    //
+    // The handle is type-erased to `const void` on purpose: callers get a
+    // liveness/ownership token, not access to reader internals. A consumer
+    // pairs the locked anchor with the already-public `message.data`/`dataSize`
+    // to form a zero-copy view valid for as long as it holds the anchor.
+    //
+    // Callers MUST NOT persistently store the locked shared_ptr: pinning a
+    // chunk past the reader's byte-budget eviction grows memory unboundedly.
+    std::weak_ptr<const void> currentBuffer() const {
+      if (!view_) {
+        return {};
+      }
+      return view_->pinned_;
     }
 
     Iterator& operator++() {
@@ -464,6 +491,9 @@ private:
         rc->liveBytesAccounted = rc->bytes.size();
         stats_->addLive(rc->liveBytesAccounted);
         stats_->chunksDecompressed.fetch_add(1, std::memory_order_relaxed);
+        // Source-file pages backing the compressed bytes are released
+        // automatically by the source itself (MmapReader bounds its own RSS via
+        // a read-driven drop-behind) — no explicit hint from here.
       }
     } catch (const std::exception& e) {
       rc->bytes.clear();

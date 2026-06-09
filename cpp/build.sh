@@ -13,8 +13,11 @@ if [ "$1" != "--build-tests-only" ]; then
     -s compiler.cppstd=17 -s build_type=Release --build missing
   conan install examples --install-folder examples/build/Release \
     -s compiler.cppstd=17 -s build_type=Release --build missing
+  conan install repackage --install-folder repackage/build/Release \
+    -s compiler.cppstd=17 -s build_type=Release --build missing
   conan build examples --build-folder examples/build/Release
   conan build bench --build-folder bench/build/Release
+  conan build repackage --build-folder repackage/build/Release
 fi
 
 conan build test --build-folder test/build/Debug

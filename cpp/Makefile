@@ -25,6 +25,7 @@ clean:
 	docker rmi -f mcap_cpp_ci_jammy
 	rm -rf bench/build
 	rm -rf examples/build
+	rm -rf repackage/build
 	rm -rf test/build
 
 .PHONY: format-check

@@ -426,6 +426,12 @@ private:
     scheduled_.assign(plans_.size(), false);
     futures_.resize(plans_.size());
 
+    // Snapshot channels/schemas by id once for const-ref lookup in produceNext.
+    // reader_.channels()/schemas() return maps BY VALUE, so copy them a single time
+    // here rather than paying a copy (and shared_ptr refcount) for every message.
+    chanById_ = reader_.channels();
+    schemaById_ = reader_.schemas();
+
     // ---- Memory back-pressure: ByteBudget (default) or ChunkCount (opt-in) ----
     // Both reuse the same ByteSemaphore; the UNIT differs (bytes vs chunks, see
     // scheduleChunk). REQUIRED frontier chunks use forceAcquire in either mode, so
@@ -503,6 +509,10 @@ private:
       const auto& plan = plans_[planIdx];
       RecordReader rr(*source_, plan.chunkStartOffset, plan.messageIndexEndOffset);
       bool gotChunk = false;
+      // Each MessageIndex contributes one contiguous, per-channel run of entries.
+      // We record the run boundaries so orderEntries() can k-way MERGE the already-
+      // sorted runs (O(N log C)) instead of a full O(N log N) std::sort.
+      std::vector<std::pair<size_t, size_t>> runs;
       for (auto rec = rr.next(); rec.has_value(); rec = rr.next()) {
         if (!rr.status().ok()) {
           rc->status = rr.status();
@@ -520,10 +530,14 @@ private:
           rc->status = McapReader::ParseMessageIndex(*rec, &mi);
           if (!rc->status.ok()) break;
           if (selectedChannels_.count(mi.channelId) == 0) continue;
+          const size_t runStart = rc->entries.size();
           for (const auto& [ts, off] : mi.records) {
             if (ts >= opts_.read.startTime && ts < opts_.read.endTime) {
               rc->entries.push_back({ts, off, plan.chunkStartOffset});
             }
+          }
+          if (rc->entries.size() > runStart) {
+            runs.emplace_back(runStart, rc->entries.size());
           }
         }
       }
@@ -531,10 +545,7 @@ private:
         rc->status = Status{StatusCode::InvalidChunkOffset, "no chunk record at planned offset"};
       }
       if (rc->status.ok()) {
-        std::sort(rc->entries.begin(), rc->entries.end(),
-                  [this](const internal::PMsgEntry& a, const internal::PMsgEntry& b) {
-                    return internal::entryLess(a, b, reverse_);
-                  });
+        orderEntries(rc->entries, runs);
         // Account the decompressed payload as resident until ~ReadyChunk frees it.
         rc->liveBytesAccounted = rc->bytes.size();
         stats_->addLive(rc->liveBytesAccounted);
@@ -554,6 +565,57 @@ private:
       rc->status = Status{StatusCode::DecompressionFailed, "unknown exception decompressing chunk"};
     }
     prom->set_value(std::move(rc));
+  }
+
+  // Put a chunk's entries into emit order. Each per-channel MessageIndex run is
+  // already monotonic in (timestamp, offset) for any well-formed file, so a k-way
+  // MERGE of the runs is O(N log C) -- cheaper than a full O(N log N) std::sort
+  // (profiling showed the per-chunk sort was a leading consumer-side cost). Falls
+  // back to a full sort for reverse reads, a single/zero run, or if any run turns
+  // out not to be monotonic (so a misbehaving writer can never break ordering).
+  void orderEntries(std::vector<internal::PMsgEntry>& entries,
+                    const std::vector<std::pair<size_t, size_t>>& runs) const {
+    const bool reverse = reverse_;
+    auto less = [reverse](const internal::PMsgEntry& a, const internal::PMsgEntry& b) {
+      return internal::entryLess(a, b, reverse);
+    };
+    if (reverse || runs.size() <= 1) {
+      if (!std::is_sorted(entries.begin(), entries.end(), less)) {
+        std::sort(entries.begin(), entries.end(), less);
+      }
+      return;
+    }
+    for (const auto& r : runs) {
+      if (!std::is_sorted(entries.begin() + static_cast<std::ptrdiff_t>(r.first),
+                          entries.begin() + static_cast<std::ptrdiff_t>(r.second), less)) {
+        std::sort(entries.begin(), entries.end(), less);
+        return;
+      }
+    }
+    // All runs sorted -> k-way merge them (offsets are unique within a chunk, so the
+    // order is a strict total order: the merge result is identical to std::sort).
+    std::vector<internal::PMsgEntry> merged;
+    merged.reserve(entries.size());
+    struct Node {
+      size_t idx;
+      size_t end;
+    };
+    auto worse = [&](const Node& a, const Node& b) {
+      // Max-heap: the run whose head sorts EARLIER must surface first, so a node is
+      // "lower priority" when its head sorts after the other's.
+      return less(entries[b.idx], entries[a.idx]);
+    };
+    std::priority_queue<Node, std::vector<Node>, decltype(worse)> pq(worse);
+    for (const auto& r : runs) {
+      if (r.first < r.second) pq.push(Node{r.first, r.second});
+    }
+    while (!pq.empty()) {
+      const Node n = pq.top();
+      pq.pop();
+      merged.push_back(entries[n.idx]);
+      if (n.idx + 1 < n.end) pq.push(Node{n.idx + 1, n.end});
+    }
+    entries.swap(merged);
   }
 
   Status decompressInto(const Chunk& chunk, internal::RawByteArray& out) {
@@ -744,17 +806,23 @@ private:
         cur.chunk.reset();
       }
 
-      // Resolve channel/schema.
-      auto channel = reader_.channel(curMessage_.channelId);
-      if (!channel) {
+      // Resolve channel/schema from one-time snapshots by const-ref, so emitting a
+      // message does NOT copy a shared_ptr just to look them up. (reader_.channel()/
+      // schema() return shared_ptr BY VALUE -- profiling showed that per-message
+      // atomic refcount churn was a leading consumer-side cost.) The only refcount
+      // left is the unavoidable copy into the MessageView itself.
+      auto cit = chanById_.find(curMessage_.channelId);
+      if (cit == chanById_.end()) {
         onProblem_(Status{StatusCode::InvalidChannelId, "message references missing channel"});
         continue;  // skip, keep going
       }
-      SchemaPtr schema;
+      const ChannelPtr& channel = cit->second;
+      const SchemaPtr* schema = &emptySchema_;
       if (channel->schemaId != 0) {
-        schema = reader_.schema(channel->schemaId);
+        auto sit = schemaById_.find(channel->schemaId);
+        if (sit != schemaById_.end()) schema = &sit->second;
       }
-      curView_.emplace(curMessage_, channel, schema, RecordOffset{entry.offset, entry.chunkOffset});
+      curView_.emplace(curMessage_, channel, *schema, RecordOffset{entry.offset, entry.chunkOffset});
       return true;
     }
   }
@@ -786,6 +854,12 @@ private:
   Message curMessage_;
   std::optional<MessageView> curView_;
   internal::ReadyChunkPtr pinned_;  // keeps curMessage_.data alive until next ++
+
+  // One-time snapshots for const-ref channel/schema resolution in produceNext (no
+  // per-message shared_ptr copy on lookup). Populated once in init().
+  std::unordered_map<ChannelId, ChannelPtr> chanById_;
+  std::unordered_map<SchemaId, SchemaPtr> schemaById_;
+  SchemaPtr emptySchema_;  // null sentinel so a missing schema returns by const-ref
   std::atomic<bool> cancelled_{false};
   Status status_;
 };

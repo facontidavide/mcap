@@ -46,7 +46,10 @@ struct Options {
   mcap::Compression compression = mcap::Compression::Zstd;
   uint32_t compressionLevel = 0;
   bool includeCrc = true;
-  uint32_t readThreads = 0;  // 0 = hardware_concurrency() (parallel read path only)
+  uint32_t readThreads = 0;  // 0 = default (4, capped at 8); parallel read path only
+  bool timeline = false;     // false = topic-grouped layout; true = timeline layout
+  bool sorted = false;       // true = time-disjoint chunks, topic-sorted within each
+  bool stats = false;        // --stats: report parallel-read chunk decompression counters
 
   uint64_t windowNs() const {
     return windowDurationSecs * kNanosPerSecond;
@@ -77,8 +80,18 @@ void printUsage(const char* argv0) {
        "                                  CompressionLevel enum: 0/3=Default, 1=Fastest,\n"
        "                                  2=Fast, 4=Slow, >=5=Slowest (default: 0)\n"
        "    --include-crc[=<bool>]        Include CRCs in the output MCAP (default: true)\n"
-       "    --read-threads <n>            Parallel-read worker threads, 0 = all cores\n"
-       "                                  (default: 0; ignored on the serial fallback path)\n"
+       "    --stats                       Print parallel-read chunk stats to stderr\n"
+       "                                  (scheduled / decompressed / forced / peak resident)\n"
+       "    --read-threads <n>            Parallel-read worker threads. 0 = default (4);\n"
+       "                                  any value is capped at 8 (ignored on the serial\n"
+       "                                  fallback path)\n"
+       "    --layout <topic|timeline|sorted>\n"
+       "                                  topic: group by topic per window (fastest lazy\n"
+       "                                  per-topic reads). timeline: time-ordered shared\n"
+       "                                  chunks + isolated large messages. sorted:\n"
+       "                                  time-disjoint chunks sorted by topic within each\n"
+       "                                  (best all-rounder: small, fast full + selective\n"
+       "                                  reads, low overlap). Default: topic\n"
        "    -h, --help                    Print help\n";
 }
 
@@ -198,6 +211,23 @@ std::optional<Options> parseArgs(int argc, char** argv) {
         std::cerr << "error: --read-threads expects a 32-bit non-negative integer\n";
         return std::nullopt;
       }
+    } else if (arg == "--layout") {
+      auto v = getValue(arg);
+      if (!v) {
+        return std::nullopt;
+      }
+      if (*v == "topic") {
+        o.timeline = false;
+      } else if (*v == "timeline") {
+        o.timeline = true;
+      } else if (*v == "sorted") {
+        o.sorted = true;
+      } else {
+        std::cerr << "error: --layout must be 'topic', 'timeline', or 'sorted'\n";
+        return std::nullopt;
+      }
+    } else if (arg == "--stats") {
+      o.stats = true;
     } else if (arg == "--include-crc") {
       // Bare "--include-crc" means true; otherwise "--include-crc=<bool>".
       if (!inlineValue) {
@@ -329,6 +359,15 @@ public:
   void push(const mcap::MessageView& mv) {
     const ChannelInfo& info = ensureChannel(mv.channel, mv.schema);
 
+    if (opts_.timeline) {
+      pushTimeline(info, mv);
+      return;
+    }
+    if (opts_.sorted) {
+      pushSorted(info, mv);
+      return;
+    }
+
     const uint64_t window =
       (mv.message.logTime / opts_.windowNs()) * opts_.windowNs();
     if (currentWindow_.has_value()) {
@@ -350,9 +389,15 @@ public:
     windowMessages_.push_back(std::move(om));
   }
 
-  // Flushes the final window. Returns the first write error encountered (if any).
+  // Flushes the final chunk/window. Returns the first write error (if any).
   mcap::Status finish() {
-    flushWindow();
+    if (opts_.timeline) {
+      writer_.closeLastChunk();
+    } else if (opts_.sorted) {
+      flushSortBuffer();
+    } else {
+      flushWindow();
+    }
     return lastStatus_;
   }
 
@@ -405,20 +450,104 @@ private:
     return res.first->second;
   }
 
-  void writeMessage(const OwnedMessage& m) {
-    const auto it = channelInfo_.find(m.srcChannelId);
+  void emitMessage(mcap::ChannelId channelId, uint32_t sequence, mcap::Timestamp logTime,
+                   mcap::Timestamp publishTime, const std::byte* data, uint64_t dataSize) {
     mcap::Message msg;
-    msg.channelId = it->second.newId;
-    msg.sequence = m.sequence;
-    msg.logTime = m.logTime;
-    msg.publishTime = m.publishTime;
-    msg.dataSize = m.data.size();
-    msg.data = m.data.data();
+    msg.channelId = channelId;
+    msg.sequence = sequence;
+    msg.logTime = logTime;
+    msg.publishTime = publishTime;
+    msg.dataSize = dataSize;
+    msg.data = data;
     const mcap::Status st = writer_.write(msg);
     if (!st.ok() && lastStatus_.ok()) {
       lastStatus_ = st;
       std::cerr << "error: failed to write message: " << st.message << "\n";
     }
+  }
+
+  void writeMessage(const OwnedMessage& m) {
+    const auto it = channelInfo_.find(m.srcChannelId);
+    emitMessage(it->second.newId, m.sequence, m.logTime, m.publishTime, m.data.data(),
+                m.data.size());
+  }
+
+  // Timeline layout: keep messages in arrival (log-time) order, packing small
+  // messages into shared chunks and isolating each large message into its own
+  // single-message chunk. No per-topic grouping, so chunks stay time-contiguous
+  // and even a sequential reader scans them without a cross-chunk merge. Writes
+  // each message directly (no per-message buffer copy; write() copies the bytes).
+  void pushTimeline(const ChannelInfo& info, const mcap::MessageView& mv) {
+    const uint64_t dataSize = mv.message.dataSize;
+    if (dataSize >= opts_.largeMessageThreshold) {
+      writer_.closeLastChunk();
+      emitMessage(info.newId, mv.message.sequence, mv.message.logTime,
+                  mv.message.publishTime, mv.message.data, dataSize);
+      writer_.closeLastChunk();
+      payloadSize_ = 0;
+      return;
+    }
+    if (payloadSize_ > 0 && saturatingAdd(payloadSize_, dataSize) > opts_.chunkSize) {
+      writer_.closeLastChunk();
+      payloadSize_ = 0;
+    }
+    emitMessage(info.newId, mv.message.sequence, mv.message.logTime, mv.message.publishTime,
+                mv.message.data, dataSize);
+    payloadSize_ = saturatingAdd(payloadSize_, dataSize);
+  }
+
+  // Sorted layout: time-disjoint chunks (so a full log-time read needs no
+  // cross-chunk merge -- fast for any reader) whose messages are sorted by
+  // channel within each chunk (topic adjacency -> better compression and faster
+  // selective reads), with large messages isolated into single-message chunks.
+  // Buffer in arrival (log-time) order until chunk-size, then sort + flush.
+  void pushSorted(const ChannelInfo& info, const mcap::MessageView& mv) {
+    const uint64_t dataSize = mv.message.dataSize;
+    if (dataSize >= opts_.largeMessageThreshold) {
+      flushSortBuffer();
+      writer_.closeLastChunk();
+      emitMessage(info.newId, mv.message.sequence, mv.message.logTime,
+                  mv.message.publishTime, mv.message.data, dataSize);
+      writer_.closeLastChunk();
+      return;
+    }
+    if (payloadSize_ > 0 && saturatingAdd(payloadSize_, dataSize) > opts_.chunkSize) {
+      flushSortBuffer();
+    }
+    OwnedMessage om;
+    om.srcChannelId = mv.channel->id;
+    om.topic = &info.topic;
+    om.sequence = mv.message.sequence;
+    om.logTime = mv.message.logTime;
+    om.publishTime = mv.message.publishTime;
+    om.data.assign(mv.message.data, mv.message.data + dataSize);
+    windowMessages_.push_back(std::move(om));
+    payloadSize_ = saturatingAdd(payloadSize_, dataSize);
+  }
+
+  void flushSortBuffer() {
+    if (windowMessages_.empty()) {
+      return;
+    }
+    std::stable_sort(windowMessages_.begin(), windowMessages_.end(),
+                     [](const OwnedMessage& a, const OwnedMessage& b) {
+                       if (a.srcChannelId != b.srcChannelId) {
+                         return a.srcChannelId < b.srcChannelId;
+                       }
+                       if (a.logTime != b.logTime) {
+                         return a.logTime < b.logTime;
+                       }
+                       return a.sequence < b.sequence;
+                     });
+    for (const OwnedMessage& m : windowMessages_) {
+      if (!lastStatus_.ok()) {
+        break;
+      }
+      writeMessage(m);
+    }
+    windowMessages_.clear();
+    payloadSize_ = 0;
+    writer_.closeLastChunk();
   }
 
   void flushWindow() {
@@ -496,6 +625,7 @@ private:
   std::unordered_map<mcap::ChannelId, ChannelInfo> channelInfo_;
   std::optional<uint64_t> currentWindow_;
   std::vector<OwnedMessage> windowMessages_;
+  uint64_t payloadSize_ = 0;  // timeline layout: running chunk payload size
   mcap::Status lastStatus_;
 };
 
@@ -733,7 +863,10 @@ int main(int argc, char** argv) {
   if (indexed) {
     mcap::ParallelReadOptions readOpts;
     readOpts.read.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
-    readOpts.threadCount = opts.readThreads;  // 0 -> hardware_concurrency()
+    readOpts.threadCount = opts.readThreads;  // 0 -> default (4, capped at 8)
+    // Opt into the chunk-count cap (the library default is the precise byte budget);
+    // it is neutral-to-faster for the repackager's full read of the input.
+    readOpts.memoryCap = mcap::MemoryCapMode::ChunkCount;
     mcap::ParallelMessageView view = reader.readMessages(onProblem, readOpts);
     if (view.status().ok()) {
       for (const auto& mv : view) {
@@ -747,6 +880,21 @@ int main(int argc, char** argv) {
         std::cerr << "error: parallel read failed: " << view.status().message << "\n";
         writer.terminate();
         return 1;
+      }
+      if (opts.stats) {
+        const auto& rs = view.stats();
+        const uint64_t scheduled = rs.chunksScheduled.load();
+        const uint64_t decompressed = rs.chunksDecompressed.load();
+        const uint64_t forced = rs.chunksForced.load();
+        const double peakMB = static_cast<double>(rs.peakDecompressedBytes.load()) / 1e6;
+        const size_t total = chunkIndexes.size();
+        const bool onceEach = (decompressed == scheduled) && (decompressed <= total);
+        std::cerr << "[stats] read path: parallel\n"
+                  << "[stats]   chunks: total=" << total << " scheduled=" << scheduled
+                  << " decompressed=" << decompressed << " forced=" << forced << "\n"
+                  << "[stats]   each chunk decompressed at most once: "
+                  << (onceEach ? "yes" : "NO (re-decompression detected!)") << "\n"
+                  << "[stats]   peak decompressed resident: " << peakMB << " MB\n";
       }
       readDone = true;
     }
@@ -762,6 +910,10 @@ int main(int argc, char** argv) {
         return 1;
       }
     }
+  }
+
+  if (opts.stats && !readDone) {
+    std::cerr << "[stats] read path: serial (no parallel decompression stats available)\n";
   }
 
   if (readProblem) {

@@ -228,16 +228,16 @@ namespace internal {
 int ZStdCompressionLevel(CompressionLevel level) {
   switch (level) {
     case CompressionLevel::Fastest:
-      return -5;
+      return 1;
     case CompressionLevel::Fast:
-      return -3;
+      return 3;
     case CompressionLevel::Default:
     default:
-      return 1;
+      return 1;  // default behaves like Fastest
     case CompressionLevel::Slow:
       return 5;
     case CompressionLevel::Slowest:
-      return 19;
+      return 7;
   }
 }
 

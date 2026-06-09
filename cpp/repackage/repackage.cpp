@@ -1,16 +1,15 @@
-// mcap-repackage: re-chunk an MCAP file by grouping messages per fixed log-time
-// window and per topic, using the multithreaded mcap::ParallelReader for reads.
+// mcap-repackage: re-chunk an MCAP file into the "sorted" layout, using the
+// multithreaded mcap::ParallelReader for reads.
 //
-// This is a C++ port of the Rust `mcap repackage` CLI command. It preserves the
-// same conversion: within each fixed log-time window, messages are sorted by
-// topic, each topic run is packed into its own chunk(s) split at a target chunk
-// size, and large messages are isolated into single-message chunks; metadata and
-// attachments are copied through unchanged. The read path
-// uses the ParallelReader (log-time order) when the input has the required chunk
-// + message indexes, and falls back to a serial read otherwise.
-//
-// Behavioral reference: rust/cli/src/commands/repackage.rs on branch
-// feature/repackage-cli-stacked.
+// Messages are read in log-time order and packed into chunks bounded by a target
+// chunk size; within each chunk they are sorted by channel (topic adjacency ->
+// better compression and faster selective reads). Because messages are buffered
+// in log-time order, each chunk spans a contiguous time slice -> chunks are
+// time-disjoint (low overlap), so a full read needs no cross-chunk merge.
+// Messages >= a threshold are isolated into single-message chunks. Metadata and
+// attachments are copied through unchanged. The read path uses the ParallelReader
+// (log-time order) when the input has the required chunk + message indexes, and
+// falls back to a serial read otherwise.
 
 #define MCAP_IMPLEMENTATION
 #include <mcap/mcap.hpp>
@@ -31,8 +30,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr uint64_t kNanosPerSecond = 1000000000ULL;
-
 // ---------------------------------------------------------------------------
 // Options + CLI parsing
 // ---------------------------------------------------------------------------
@@ -40,26 +37,20 @@ constexpr uint64_t kNanosPerSecond = 1000000000ULL;
 struct Options {
   std::string inputPath;
   std::string outputPath;
-  uint64_t windowDurationSecs = 1;
   uint64_t largeMessageThreshold = 256 * 1024;
   uint64_t chunkSize = 4 * 1024 * 1024;
   mcap::Compression compression = mcap::Compression::Zstd;
   uint32_t compressionLevel = 0;
   bool includeCrc = true;
   uint32_t readThreads = 0;  // 0 = default (4, capped at 8); parallel read path only
-  bool timeline = false;     // false = topic-grouped layout; true = timeline layout
-  bool sorted = false;       // true = time-disjoint chunks, topic-sorted within each
   bool stats = false;        // --stats: report parallel-read chunk decompression counters
-
-  uint64_t windowNs() const {
-    return windowDurationSecs * kNanosPerSecond;
-  }
 };
 
 void printUsage(const char* argv0) {
   std::cerr
-    << "mcap-repackage - re-chunk an MCAP file (per log-time window, grouped by\n"
-       "                 topic) using the multithreaded ParallelReader.\n\n"
+    << "mcap-repackage - re-chunk an MCAP file into time-ordered chunks, grouped\n"
+       "                 by topic within each chunk (better compression + lazy reads),\n"
+       "                 using the multithreaded ParallelReader.\n\n"
        "USAGE:\n"
        "    "
     << argv0
@@ -69,11 +60,10 @@ void printUsage(const char* argv0) {
        "OPTIONS:\n"
        "    -o, --output <path>           Destination repackaged MCAP file\n"
        "                                  (alias: --output-file)\n"
-       "    --window-duration-secs <n>    Log-time window in seconds (default: 1)\n"
        "    --large-message-threshold <n> Messages >= this data size are written as\n"
        "                                  single-message chunks (default: 262144)\n"
-       "    --chunk-size <n>              Target uncompressed chunk size in bytes for\n"
-       "                                  small-message groups (default: 4194304)\n"
+       "    --chunk-size <n>              Target uncompressed chunk size in bytes\n"
+       "                                  (default: 4194304)\n"
        "    --compression <c>             Output chunk compression: zstd, lz4, or none\n"
        "                                  (default: zstd)\n"
        "    --compression-level <n>       0 = compressor default. Mapped to the C++\n"
@@ -85,13 +75,6 @@ void printUsage(const char* argv0) {
        "    --read-threads <n>            Parallel-read worker threads. 0 = default (4);\n"
        "                                  any value is capped at 8 (ignored on the serial\n"
        "                                  fallback path)\n"
-       "    --layout <topic|timeline|sorted>\n"
-       "                                  topic: group by topic per window (fastest lazy\n"
-       "                                  per-topic reads). timeline: time-ordered shared\n"
-       "                                  chunks + isolated large messages. sorted:\n"
-       "                                  time-disjoint chunks sorted by topic within each\n"
-       "                                  (best all-rounder: small, fast full + selective\n"
-       "                                  reads, low overlap). Default: topic\n"
        "    -h, --help                    Print help\n";
 }
 
@@ -166,12 +149,6 @@ std::optional<Options> parseArgs(int argc, char** argv) {
       }
       o.outputPath = *v;
       haveOutput = true;
-    } else if (arg == "--window-duration-secs") {
-      auto v = getValue(arg);
-      if (!v || !parseUint64(*v, o.windowDurationSecs)) {
-        std::cerr << "error: --window-duration-secs expects a non-negative integer\n";
-        return std::nullopt;
-      }
     } else if (arg == "--large-message-threshold") {
       auto v = getValue(arg);
       if (!v || !parseUint64(*v, o.largeMessageThreshold)) {
@@ -211,21 +188,6 @@ std::optional<Options> parseArgs(int argc, char** argv) {
         std::cerr << "error: --read-threads expects a 32-bit non-negative integer\n";
         return std::nullopt;
       }
-    } else if (arg == "--layout") {
-      auto v = getValue(arg);
-      if (!v) {
-        return std::nullopt;
-      }
-      if (*v == "topic") {
-        o.timeline = false;
-      } else if (*v == "timeline") {
-        o.timeline = true;
-      } else if (*v == "sorted") {
-        o.sorted = true;
-      } else {
-        std::cerr << "error: --layout must be 'topic', 'timeline', or 'sorted'\n";
-        return std::nullopt;
-      }
     } else if (arg == "--stats") {
       o.stats = true;
     } else if (arg == "--include-crc") {
@@ -260,14 +222,6 @@ std::optional<Options> parseArgs(int argc, char** argv) {
   }
   if (!haveOutput) {
     std::cerr << "error: missing required --output <path> argument\n";
-    return std::nullopt;
-  }
-  if (o.windowDurationSecs == 0) {
-    std::cerr << "error: --window-duration-secs must be greater than zero\n";
-    return std::nullopt;
-  }
-  if (o.windowDurationSecs > std::numeric_limits<uint64_t>::max() / kNanosPerSecond) {
-    std::cerr << "error: window duration overflows nanoseconds\n";
     return std::nullopt;
   }
   return o;
@@ -330,18 +284,12 @@ bool ensureDistinctInputOutput(const Options& o) {
 }
 
 // ---------------------------------------------------------------------------
-// Repackager: windows messages, sorts by topic within a window, and writes them
-// with tool-controlled chunk boundaries.
+// Repackager: buffers messages into size-bounded chunks, sorts each chunk by
+// channel before writing, and isolates large messages -- the "sorted" layout.
 // ---------------------------------------------------------------------------
 
-struct ChannelInfo {
-  mcap::ChannelId newId = 0;
-  std::string topic;
-};
-
 struct OwnedMessage {
-  mcap::ChannelId srcChannelId = 0;
-  const std::string* topic = nullptr;  // points into stable ChannelInfo storage
+  mcap::ChannelId channelId = 0;  // output (re-registered) channel id
   uint32_t sequence = 0;
   mcap::Timestamp logTime = 0;
   mcap::Timestamp publishTime = 0;
@@ -354,50 +302,38 @@ public:
     : writer_(writer)
     , opts_(opts) {}
 
-  // Copies one message into the current window (registering its schema/channel
-  // on the output writer the first time that source channel is seen).
+  // Buffer one message into the current chunk, registering its schema/channel on
+  // the output writer the first time that source channel is seen. A large message
+  // is isolated into its own chunk; otherwise the buffered chunk is flushed
+  // (sorted by channel, then closed) once it reaches the target chunk size.
   void push(const mcap::MessageView& mv) {
-    const ChannelInfo& info = ensureChannel(mv.channel, mv.schema);
+    const mcap::ChannelId channelId = ensureChannel(mv.channel, mv.schema);
+    const uint64_t dataSize = mv.message.dataSize;
 
-    if (opts_.timeline) {
-      pushTimeline(info, mv);
+    if (dataSize >= opts_.largeMessageThreshold) {
+      flushChunk();
+      writer_.closeLastChunk();
+      emitMessage(channelId, mv.message.sequence, mv.message.logTime, mv.message.publishTime,
+                  mv.message.data, dataSize);
+      writer_.closeLastChunk();
       return;
     }
-    if (opts_.sorted) {
-      pushSorted(info, mv);
-      return;
+    if (payloadSize_ > 0 && saturatingAdd(payloadSize_, dataSize) > opts_.chunkSize) {
+      flushChunk();
     }
-
-    const uint64_t window =
-      (mv.message.logTime / opts_.windowNs()) * opts_.windowNs();
-    if (currentWindow_.has_value()) {
-      if (*currentWindow_ != window) {
-        flushWindow();
-        currentWindow_ = window;
-      }
-    } else {
-      currentWindow_ = window;
-    }
-
     OwnedMessage om;
-    om.srcChannelId = mv.channel->id;
-    om.topic = &info.topic;
+    om.channelId = channelId;
     om.sequence = mv.message.sequence;
     om.logTime = mv.message.logTime;
     om.publishTime = mv.message.publishTime;
-    om.data.assign(mv.message.data, mv.message.data + mv.message.dataSize);
-    windowMessages_.push_back(std::move(om));
+    om.data.assign(mv.message.data, mv.message.data + dataSize);
+    buffer_.push_back(std::move(om));
+    payloadSize_ = saturatingAdd(payloadSize_, dataSize);
   }
 
-  // Flushes the final chunk/window. Returns the first write error (if any).
+  // Flushes the final chunk. Returns the first write error (if any).
   mcap::Status finish() {
-    if (opts_.timeline) {
-      writer_.closeLastChunk();
-    } else if (opts_.sorted) {
-      flushSortBuffer();
-    } else {
-      flushWindow();
-    }
+    flushChunk();
     return lastStatus_;
   }
 
@@ -406,10 +342,12 @@ public:
   }
 
 private:
-  const ChannelInfo& ensureChannel(const mcap::ChannelPtr& channel,
-                                   const mcap::SchemaPtr& schema) {
-    auto it = channelInfo_.find(channel->id);
-    if (it != channelInfo_.end()) {
+  // Register a source channel (and its schema) on the output writer the first
+  // time it is seen; returns the new output channel id. Fails fast if the channel
+  // references a schema that is not present in the file.
+  mcap::ChannelId ensureChannel(const mcap::ChannelPtr& channel, const mcap::SchemaPtr& schema) {
+    auto it = channelMap_.find(channel->id);
+    if (it != channelMap_.end()) {
       return it->second;
     }
 
@@ -442,12 +380,8 @@ private:
     mcap::Channel outChannel(channel->topic, channel->messageEncoding, newSchemaId,
                              channel->metadata);
     writer_.addChannel(outChannel);
-
-    ChannelInfo info;
-    info.newId = outChannel.id;
-    info.topic = channel->topic;
-    auto res = channelInfo_.emplace(channel->id, std::move(info));
-    return res.first->second;
+    channelMap_.emplace(channel->id, outChannel.id);
+    return outChannel.id;
   }
 
   void emitMessage(mcap::ChannelId channelId, uint32_t sequence, mcap::Timestamp logTime,
@@ -466,166 +400,42 @@ private:
     }
   }
 
-  void writeMessage(const OwnedMessage& m) {
-    const auto it = channelInfo_.find(m.srcChannelId);
-    emitMessage(it->second.newId, m.sequence, m.logTime, m.publishTime, m.data.data(),
-                m.data.size());
-  }
-
-  // Timeline layout: keep messages in arrival (log-time) order, packing small
-  // messages into shared chunks and isolating each large message into its own
-  // single-message chunk. No per-topic grouping, so chunks stay time-contiguous
-  // and even a sequential reader scans them without a cross-chunk merge. Writes
-  // each message directly (no per-message buffer copy; write() copies the bytes).
-  void pushTimeline(const ChannelInfo& info, const mcap::MessageView& mv) {
-    const uint64_t dataSize = mv.message.dataSize;
-    if (dataSize >= opts_.largeMessageThreshold) {
-      writer_.closeLastChunk();
-      emitMessage(info.newId, mv.message.sequence, mv.message.logTime,
-                  mv.message.publishTime, mv.message.data, dataSize);
-      writer_.closeLastChunk();
-      payloadSize_ = 0;
+  // Sort the buffered chunk by (channel, log time, sequence) and write it as one
+  // chunk, then close it. Messages were buffered in arrival (log-time) order, so
+  // each chunk spans a contiguous time slice (chunks are time-disjoint); the
+  // within-chunk channel grouping improves compression and selective reads
+  // without making chunks overlap in time. Large messages are isolated by push().
+  void flushChunk() {
+    if (buffer_.empty()) {
       return;
     }
-    if (payloadSize_ > 0 && saturatingAdd(payloadSize_, dataSize) > opts_.chunkSize) {
-      writer_.closeLastChunk();
-      payloadSize_ = 0;
-    }
-    emitMessage(info.newId, mv.message.sequence, mv.message.logTime, mv.message.publishTime,
-                mv.message.data, dataSize);
-    payloadSize_ = saturatingAdd(payloadSize_, dataSize);
-  }
-
-  // Sorted layout: time-disjoint chunks (so a full log-time read needs no
-  // cross-chunk merge -- fast for any reader) whose messages are sorted by
-  // channel within each chunk (topic adjacency -> better compression and faster
-  // selective reads), with large messages isolated into single-message chunks.
-  // Buffer in arrival (log-time) order until chunk-size, then sort + flush.
-  void pushSorted(const ChannelInfo& info, const mcap::MessageView& mv) {
-    const uint64_t dataSize = mv.message.dataSize;
-    if (dataSize >= opts_.largeMessageThreshold) {
-      flushSortBuffer();
-      writer_.closeLastChunk();
-      emitMessage(info.newId, mv.message.sequence, mv.message.logTime,
-                  mv.message.publishTime, mv.message.data, dataSize);
-      writer_.closeLastChunk();
-      return;
-    }
-    if (payloadSize_ > 0 && saturatingAdd(payloadSize_, dataSize) > opts_.chunkSize) {
-      flushSortBuffer();
-    }
-    OwnedMessage om;
-    om.srcChannelId = mv.channel->id;
-    om.topic = &info.topic;
-    om.sequence = mv.message.sequence;
-    om.logTime = mv.message.logTime;
-    om.publishTime = mv.message.publishTime;
-    om.data.assign(mv.message.data, mv.message.data + dataSize);
-    windowMessages_.push_back(std::move(om));
-    payloadSize_ = saturatingAdd(payloadSize_, dataSize);
-  }
-
-  void flushSortBuffer() {
-    if (windowMessages_.empty()) {
-      return;
-    }
-    std::stable_sort(windowMessages_.begin(), windowMessages_.end(),
+    std::stable_sort(buffer_.begin(), buffer_.end(),
                      [](const OwnedMessage& a, const OwnedMessage& b) {
-                       if (a.srcChannelId != b.srcChannelId) {
-                         return a.srcChannelId < b.srcChannelId;
+                       if (a.channelId != b.channelId) {
+                         return a.channelId < b.channelId;
                        }
                        if (a.logTime != b.logTime) {
                          return a.logTime < b.logTime;
                        }
                        return a.sequence < b.sequence;
                      });
-    for (const OwnedMessage& m : windowMessages_) {
+    for (const OwnedMessage& m : buffer_) {
       if (!lastStatus_.ok()) {
         break;
       }
-      writeMessage(m);
+      emitMessage(m.channelId, m.sequence, m.logTime, m.publishTime, m.data.data(), m.data.size());
     }
-    windowMessages_.clear();
+    buffer_.clear();
     payloadSize_ = 0;
-    writer_.closeLastChunk();
-  }
-
-  void flushWindow() {
-    if (windowMessages_.empty()) {
-      return;
-    }
-
-    std::vector<OwnedMessage> msgs = std::move(windowMessages_);
-    windowMessages_.clear();
-
-    // Sort by (topic, channel id, log time, sequence, publish time). stable_sort
-    // mirrors Rust's stable Vec::sort_by for fully-equal keys.
-    std::stable_sort(msgs.begin(), msgs.end(),
-                     [](const OwnedMessage& a, const OwnedMessage& b) {
-                       if (*a.topic != *b.topic) {
-                         return *a.topic < *b.topic;
-                       }
-                       if (a.srcChannelId != b.srcChannelId) {
-                         return a.srcChannelId < b.srcChannelId;
-                       }
-                       if (a.logTime != b.logTime) {
-                         return a.logTime < b.logTime;
-                       }
-                       if (a.sequence != b.sequence) {
-                         return a.sequence < b.sequence;
-                       }
-                       return a.publishTime < b.publishTime;
-                     });
-
-    std::optional<mcap::ChannelId> currentChannel;
-    uint64_t payloadSize = 0;
-    for (const OwnedMessage& m : msgs) {
-      if (!lastStatus_.ok()) {
-        return;
-      }
-
-      // (1) Channel change forces a fresh chunk so each topic run is isolated.
-      const bool channelChanged =
-        !currentChannel.has_value() || *currentChannel != m.srcChannelId;
-      if (channelChanged) {
-        writer_.closeLastChunk();
-        currentChannel = m.srcChannelId;
-        payloadSize = 0;
-      }
-
-      const uint64_t dataSize = m.data.size();
-
-      // (2) Large messages get their own single-message chunk.
-      if (dataSize >= opts_.largeMessageThreshold) {
-        writer_.closeLastChunk();
-        writeMessage(m);
-        writer_.closeLastChunk();
-        payloadSize = 0;
-        continue;
-      }
-
-      // (3) Split the chunk before it would exceed the target chunk size. Only
-      //     when payload > 0, so the first message of a chunk is never pre-split.
-      if (payloadSize > 0 && saturatingAdd(payloadSize, dataSize) > opts_.chunkSize) {
-        writer_.closeLastChunk();
-        payloadSize = 0;
-      }
-
-      writeMessage(m);
-      payloadSize = saturatingAdd(payloadSize, dataSize);
-    }
-
-    // Final boundary for this window.
     writer_.closeLastChunk();
   }
 
   mcap::McapWriter& writer_;
   const Options& opts_;
   std::unordered_map<mcap::SchemaId, mcap::SchemaId> schemaMap_;
-  std::unordered_map<mcap::ChannelId, ChannelInfo> channelInfo_;
-  std::optional<uint64_t> currentWindow_;
-  std::vector<OwnedMessage> windowMessages_;
-  uint64_t payloadSize_ = 0;  // timeline layout: running chunk payload size
+  std::unordered_map<mcap::ChannelId, mcap::ChannelId> channelMap_;
+  std::vector<OwnedMessage> buffer_;       // messages buffered for the current chunk
+  uint64_t payloadSize_ = 0;               // running size of the buffered chunk
   mcap::Status lastStatus_;
 };
 
@@ -785,9 +595,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Configure the writer. The repackager controls EVERY chunk boundary
-  // explicitly via closeLastChunk() (window, topic-run, large-message, and the
-  // chunk-size split), matching the Rust chunk_size(None) + manual-flush design.
+  // Configure the writer. The repackager controls EVERY chunk boundary explicitly
+  // via closeLastChunk() (the chunk-size flush and large-message isolation).
   // The C++ writer has no flag to disable its own size-based auto-flush, and its
   // chunk buffer is reserved to writeOpts.chunkSize, so we set a ceiling that is
   // (a) at least as large as any boundary we request (so the writer does not

@@ -1,23 +1,23 @@
 # mcap-repackage
 
-A C++ command-line tool that re-chunks an MCAP file for better compression and
-per-topic read locality. It is a port of the Rust `mcap repackage` command and
-performs the same conversion, but uses the multithreaded `mcap::ParallelReader`
-for the read path.
+A C++ command-line tool that re-chunks an MCAP file for smaller size and faster
+reads, using the multithreaded `mcap::ParallelReader` for the read path.
 
 ## What it does
 
-For each fixed **log-time window** (default 1 second), messages are:
+Messages are read in **log-time order** and:
 
-1. grouped and sorted by **topic** (then channel id, log time, sequence, publish
-   time),
-2. packed into chunks with **one chunk per topic run**,
-3. split when a chunk would exceed `--chunk-size`, and
-4. written as **single-message chunks** when a message is `>=`
+1. packed into chunks bounded by `--chunk-size`;
+2. sorted by **channel** within each chunk (topic adjacency → better compression
+   and faster selective reads);
+3. written as **single-message chunks** when a message is `>=`
    `--large-message-threshold`.
 
-Metadata and attachments are copied through unchanged. The output is a fully
-indexed MCAP file.
+Because messages are buffered in log-time order, each chunk spans a contiguous
+time slice, so the chunks are **time-disjoint (low overlap)** — a full log-time
+read needs no cross-chunk merge, and a reader can still skip chunks for selective
+reads. Metadata and attachments are copied through unchanged; the output is a
+fully indexed MCAP file.
 
 The read path uses the `ParallelReader` (log-time order) when the input has the
 required chunk + message indexes; otherwise it falls back to a serial read.
@@ -29,40 +29,40 @@ mcap-repackage <input.mcap> --output <output.mcap> [OPTIONS]
 
 OPTIONS:
   -o, --output <path>             Destination file (alias: --output-file)
-  --window-duration-secs <n>      Log-time window in seconds (default: 1)
   --large-message-threshold <n>   Bytes; messages >= this get their own chunk
                                   (default: 262144)
-  --chunk-size <n>                Target uncompressed chunk size in bytes for
-                                  small-message groups (default: 4194304)
+  --chunk-size <n>                Target uncompressed chunk size in bytes
+                                  (default: 4194304)
   --compression <c>               zstd | lz4 | none (default: zstd)
   --compression-level <n>         0 = compressor default (default: 0)
   --include-crc[=<bool>]          Include CRCs in the output (default: true)
+  --read-threads <n>              Parallel-read worker threads; 0 = default (4),
+                                  capped at 8
+  --stats                         Print parallel-read chunk counters to stderr
   -h, --help                      Print help
 ```
 
-> **Note on `--compression-level`:** the C++ MCAP writer exposes only five
-> levels, so the numeric value is mapped onto the `CompressionLevel` enum
-> (`0`/`3` = Default, `1` = Fastest, `2` = Fast, `4` = Slow, `>=5` = Slowest).
-> Level `0` keeps the Rust semantic of "use the compressor default".
+> **Note on `--compression-level`:** the C++ MCAP writer exposes five discrete
+> levels, mapped onto the `CompressionLevel` enum → zstd `{Fastest=1, Fast=3,
+> Default=1, Slow=5, Slowest=7}`. Level `0` = Default = zstd 1. zstd-1 is the
+> recommended default: with the parallel reader, decompression is fully hidden, so
+> a higher level only shrinks the file marginally at a read-speed cost that the
+> reader already absorbs.
 
-## Differences from the Rust command
+## Notes / library quirks
 
-The conversion (windowing, per-topic grouping, chunk-size splitting, large-message
-isolation, metadata/attachment passthrough) matches the Rust `repackage` command.
-Two differences stem from the C++ MCAP library:
-
-- **Chunk-size ceiling.** The Rust writer disables size-based auto-flush
-  (`chunk_size(None)`); the C++ writer cannot, and its chunk buffer is reserved to
-  the chunk size. The tool therefore controls boundaries explicitly but caps the
-  writer's reserve/auto-flush threshold at 2 GiB. A `--chunk-size` (or
-  `--large-message-threshold`) above that cap, or pathologically tiny messages,
-  may produce an extra chunk boundary at the ceiling — a benign layout difference,
-  never data loss.
+- **Chunk-size ceiling.** The C++ writer's chunk buffer is reserved to its chunk
+  size, so the tool can't set it to "infinite" to fully disable size-based
+  auto-flush; it caps the reserve/auto-flush threshold at 2 GiB. A `--chunk-size`
+  (or `--large-message-threshold`) above that cap, or pathologically tiny
+  messages, may add an extra chunk boundary at the ceiling — a benign layout
+  difference, never data loss. Keep `--chunk-size` around the 4 MiB default
+  (sweeps showed 2–8 MiB is the size/speed sweet spot).
 - **Unindexed log-time reads.** A chunked input that has chunk indexes but no
   message indexes cannot be read in log-time order by this library, so it is read
-  in file order (which assumes the input is approximately log-time ordered, as
-  Rust's own linear path does). Files with full indexes use the `ParallelReader`;
-  unchunked files use the serial reader.
+  in file order (which assumes the input is approximately log-time ordered).
+  Files with full indexes use the `ParallelReader`; unchunked files use the serial
+  reader.
 
 ## Building
 

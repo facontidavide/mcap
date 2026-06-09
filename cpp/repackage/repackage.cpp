@@ -207,8 +207,8 @@ std::optional<Options> parseArgs(int argc, char** argv) {
       return std::nullopt;
     } else {
       if (haveInput) {
-        std::cerr << "error: multiple input files specified ('" << o.inputPath
-                  << "' and '" << raw << "')\n";
+        std::cerr << "error: multiple input files specified ('" << o.inputPath << "' and '" << raw
+                  << "')\n";
         return std::nullopt;
       }
       o.inputPath = raw;
@@ -232,9 +232,8 @@ std::optional<Options> parseArgs(int argc, char** argv) {
 // ---------------------------------------------------------------------------
 
 uint64_t saturatingAdd(uint64_t a, uint64_t b) {
-  return (a > std::numeric_limits<uint64_t>::max() - b)
-           ? std::numeric_limits<uint64_t>::max()
-           : a + b;
+  return (a > std::numeric_limits<uint64_t>::max() - b) ? std::numeric_limits<uint64_t>::max()
+                                                        : a + b;
 }
 
 // Map the numeric --compression-level onto the C++ CompressionLevel enum. The
@@ -243,13 +242,12 @@ uint64_t saturatingAdd(uint64_t a, uint64_t b) {
 mcap::CompressionLevel mapCompressionLevel(uint32_t level) {
   switch (level) {
     case 0:
+    case 3:
       return mcap::CompressionLevel::Default;
     case 1:
       return mcap::CompressionLevel::Fastest;
     case 2:
       return mcap::CompressionLevel::Fast;
-    case 3:
-      return mcap::CompressionLevel::Default;
     case 4:
       return mcap::CompressionLevel::Slow;
     default:
@@ -263,8 +261,8 @@ bool ensureDistinctInputOutput(const Options& o) {
   std::error_code ec;
   const fs::path in = fs::canonical(o.inputPath, ec);
   if (ec) {
-    std::cerr << "error: failed to canonicalize input '" << o.inputPath
-              << "': " << ec.message() << "\n";
+    std::cerr << "error: failed to canonicalize input '" << o.inputPath << "': " << ec.message()
+              << "\n";
     return false;
   }
   if (!fs::exists(o.outputPath)) {
@@ -272,8 +270,8 @@ bool ensureDistinctInputOutput(const Options& o) {
   }
   const fs::path out = fs::canonical(o.outputPath, ec);
   if (ec) {
-    std::cerr << "error: failed to canonicalize output '" << o.outputPath
-              << "': " << ec.message() << "\n";
+    std::cerr << "error: failed to canonicalize output '" << o.outputPath << "': " << ec.message()
+              << "\n";
     return false;
   }
   if (in == out) {
@@ -299,8 +297,8 @@ struct OwnedMessage {
 class Repackager {
 public:
   Repackager(mcap::McapWriter& writer, const Options& opts)
-    : writer_(writer)
-    , opts_(opts) {}
+      : writer_(writer)
+      , opts_(opts) {}
 
   // Buffer one message into the current chunk, registering its schema/channel on
   // the output writer the first time that source channel is seen. A large message
@@ -358,10 +356,9 @@ private:
         // rather than silently writing a schema-less channel (Rust aborts with
         // UnknownSchema here).
         if (lastStatus_.ok()) {
-          lastStatus_ = mcap::Status(
-            mcap::StatusCode::InvalidSchemaId,
-            "channel '" + channel->topic + "' references missing schema " +
-              std::to_string(channel->schemaId));
+          lastStatus_ = mcap::Status(mcap::StatusCode::InvalidSchemaId,
+                                     "channel '" + channel->topic + "' references missing schema " +
+                                       std::to_string(channel->schemaId));
           std::cerr << "error: " << lastStatus_.message << "\n";
         }
       } else {
@@ -434,8 +431,8 @@ private:
   const Options& opts_;
   std::unordered_map<mcap::SchemaId, mcap::SchemaId> schemaMap_;
   std::unordered_map<mcap::ChannelId, mcap::ChannelId> channelMap_;
-  std::vector<OwnedMessage> buffer_;       // messages buffered for the current chunk
-  uint64_t payloadSize_ = 0;               // running size of the buffered chunk
+  std::vector<OwnedMessage> buffer_;  // messages buffered for the current chunk
+  uint64_t payloadSize_ = 0;          // running size of the buffered chunk
   mcap::Status lastStatus_;
 };
 
@@ -443,72 +440,56 @@ private:
 // Metadata + attachment copy (after messages, before close).
 // ---------------------------------------------------------------------------
 
-bool copyMetadataFromIndexes(mcap::McapReader& reader, mcap::McapWriter& writer) {
-  std::vector<mcap::MetadataIndex> indexes;
-  for (const auto& kv : reader.metadataIndexes()) {
+// Copy records identified by their summary indexes (metadata or attachments)
+// through to the writer, in original file order. The metadata and attachment
+// paths differ only in record type, parse function, and the noun in error
+// messages, so they share this one implementation.
+template <typename IndexMap, typename Record>
+bool copyRecordsFromIndexes(mcap::McapReader& reader, mcap::McapWriter& writer, const char* noun,
+                            const IndexMap& indexMap,
+                            mcap::Status (*parse)(const mcap::Record&, Record*)) {
+  using Index = typename IndexMap::mapped_type;
+  std::vector<Index> indexes;
+  indexes.reserve(indexMap.size());
+  for (const auto& kv : indexMap) {
     indexes.push_back(kv.second);
   }
-  std::sort(indexes.begin(), indexes.end(),
-            [](const mcap::MetadataIndex& a, const mcap::MetadataIndex& b) {
-              return a.offset < b.offset;
-            });
+  std::sort(indexes.begin(), indexes.end(), [](const Index& a, const Index& b) {
+    return a.offset < b.offset;
+  });
   for (const auto& index : indexes) {
     mcap::Record record;
     mcap::Status st = mcap::McapReader::ReadRecord(*reader.dataSource(), index.offset, &record);
     if (!st.ok()) {
-      std::cerr << "error: failed to read metadata at offset " << index.offset
-                << ": " << st.message << "\n";
+      std::cerr << "error: failed to read " << noun << " at offset " << index.offset << ": "
+                << st.message << "\n";
       return false;
     }
-    mcap::Metadata metadata;
-    st = mcap::McapReader::ParseMetadata(record, &metadata);
+    Record parsed;
+    st = parse(record, &parsed);
     if (!st.ok()) {
-      std::cerr << "error: failed to parse metadata '" << index.name
-                << "': " << st.message << "\n";
+      std::cerr << "error: failed to parse " << noun << " '" << index.name << "': " << st.message
+                << "\n";
       return false;
     }
-    st = writer.write(metadata);
+    st = writer.write(parsed);
     if (!st.ok()) {
-      std::cerr << "error: failed to write metadata '" << metadata.name
-                << "': " << st.message << "\n";
+      std::cerr << "error: failed to write " << noun << " '" << parsed.name << "': " << st.message
+                << "\n";
       return false;
     }
   }
   return true;
 }
 
+bool copyMetadataFromIndexes(mcap::McapReader& reader, mcap::McapWriter& writer) {
+  return copyRecordsFromIndexes(reader, writer, "metadata", reader.metadataIndexes(),
+                                mcap::McapReader::ParseMetadata);
+}
+
 bool copyAttachmentsFromIndexes(mcap::McapReader& reader, mcap::McapWriter& writer) {
-  std::vector<mcap::AttachmentIndex> indexes;
-  for (const auto& kv : reader.attachmentIndexes()) {
-    indexes.push_back(kv.second);
-  }
-  std::sort(indexes.begin(), indexes.end(),
-            [](const mcap::AttachmentIndex& a, const mcap::AttachmentIndex& b) {
-              return a.offset < b.offset;
-            });
-  for (const auto& index : indexes) {
-    mcap::Record record;
-    mcap::Status st = mcap::McapReader::ReadRecord(*reader.dataSource(), index.offset, &record);
-    if (!st.ok()) {
-      std::cerr << "error: failed to read attachment at offset " << index.offset
-                << ": " << st.message << "\n";
-      return false;
-    }
-    mcap::Attachment attachment;
-    st = mcap::McapReader::ParseAttachment(record, &attachment);
-    if (!st.ok()) {
-      std::cerr << "error: failed to parse attachment '" << index.name
-                << "': " << st.message << "\n";
-      return false;
-    }
-    st = writer.write(attachment);
-    if (!st.ok()) {
-      std::cerr << "error: failed to write attachment '" << attachment.name
-                << "': " << st.message << "\n";
-      return false;
-    }
-  }
-  return true;
+  return copyRecordsFromIndexes(reader, writer, "attachment", reader.attachmentIndexes(),
+                                mcap::McapReader::ParseAttachment);
 }
 
 bool indexesComplete(size_t indexCount, bool haveStats, uint32_t statCount) {
@@ -530,10 +511,8 @@ bool copyMetadataAndAttachments(mcap::McapReader& reader, const std::string& inp
     metaCount = reader.statistics()->metadataCount;
     attCount = reader.statistics()->attachmentCount;
   }
-  const bool metaComplete =
-    indexesComplete(reader.metadataIndexes().size(), haveStats, metaCount);
-  const bool attComplete =
-    indexesComplete(reader.attachmentIndexes().size(), haveStats, attCount);
+  const bool metaComplete = indexesComplete(reader.metadataIndexes().size(), haveStats, metaCount);
+  const bool attComplete = indexesComplete(reader.attachmentIndexes().size(), haveStats, attCount);
 
   if (metaComplete && !copyMetadataFromIndexes(reader, writer)) {
     return false;
@@ -590,8 +569,7 @@ int main(int argc, char** argv) {
   mcap::ParallelReader reader;
   mcap::Status st = reader.open(opts.inputPath);
   if (!st.ok()) {
-    std::cerr << "error: failed to open input '" << opts.inputPath << "': "
-              << st.message << "\n";
+    std::cerr << "error: failed to open input '" << opts.inputPath << "': " << st.message << "\n";
     return 1;
   }
 
@@ -617,7 +595,7 @@ int main(int argc, char** argv) {
     writeOpts.library = *library;
   }
   writeOpts.noChunking = false;
-  constexpr uint64_t kBaseCeiling = 256ull * 1024 * 1024;     // 256 MiB
+  constexpr uint64_t kBaseCeiling = 256ull * 1024 * 1024;      // 256 MiB
   constexpr uint64_t kMaxCeiling = 2ull * 1024 * 1024 * 1024;  // 2 GiB reserve cap
   uint64_t ceiling = std::max({kBaseCeiling, opts.chunkSize, opts.largeMessageThreshold});
   ceiling = std::min(ceiling, kMaxCeiling);
@@ -665,8 +643,9 @@ int main(int argc, char** argv) {
   const auto& chunkIndexes = reader.chunkIndexes();
   const bool indexed =
     !chunkIndexes.empty() &&
-    std::any_of(chunkIndexes.begin(), chunkIndexes.end(),
-                [](const mcap::ChunkIndex& c) { return c.messageIndexLength != 0; });
+    std::any_of(chunkIndexes.begin(), chunkIndexes.end(), [](const mcap::ChunkIndex& c) {
+      return c.messageIndexLength != 0;
+    });
 
   bool readDone = false;
   if (indexed) {
@@ -746,11 +725,9 @@ int main(int argc, char** argv) {
   writer.close();
   output.flush();
   if (!output) {
-    std::cerr << "error: failed to write output '" << opts.outputPath
-              << "' (I/O error)\n";
+    std::cerr << "error: failed to write output '" << opts.outputPath << "' (I/O error)\n";
     return 1;
   }
-  std::cout << "repackaged '" << opts.inputPath << "' -> '" << opts.outputPath
-            << "'\n";
+  std::cout << "repackaged '" << opts.inputPath << "' -> '" << opts.outputPath << "'\n";
   return 0;
 }

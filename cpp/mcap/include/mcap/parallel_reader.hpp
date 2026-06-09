@@ -53,13 +53,29 @@
 
 namespace mcap {
 
+// Back-pressure policy for the parallel reader's resident decompressed memory.
+enum class MemoryCapMode {
+  ByteBudget,  // default: cap resident decompressed BYTES (precise memory ceiling)
+  ChunkCount,  // opt-in: cap the NUMBER of concurrently-live chunks (coarser bound)
+};
+
 struct ParallelReadOptions {
   ReadMessageOptions read;        // startTime/endTime/topicFilter/readOrder
-  unsigned threadCount = 0;       // 0 -> hardware_concurrency()
+  unsigned threadCount = 0;       // 0 -> 4 workers (default); any value is capped at 8
+  // Memory back-pressure mode. ByteBudget (default) bounds resident bytes
+  // precisely (a hard, portable ceiling -- matters for general use and WASM);
+  // ChunkCount bounds the number of live chunks instead (simpler, a touch faster
+  // on chunk-dense layouts, but a coarser ~cap*max-chunk-size memory bound).
+  MemoryCapMode memoryCap = MemoryCapMode::ByteBudget;
+  // ChunkCount mode only: max concurrently-live (decompressed) chunks. 0 -> 2 *
+  // topics (channels in the file). REQUIRED frontier chunks bypass the cap via
+  // forceAcquire, so it only throttles prefetch and never deadlocks the merge.
+  unsigned maxLiveChunks = 0;
+  // ByteBudget mode only:
   uint64_t maxBytesInFlight = 0;  // soft cap; 0 -> floor + lookahead (unbounded-ish)
   uint64_t lookaheadBytes = 0;    // prefetch headroom above the floor; 0 -> auto
   MemoryCapPolicy capPolicy =
-    MemoryCapPolicy::Adapt;  // default: exceed the cap rather than deadlock
+    MemoryCapPolicy::Adapt;  // sub-floor behavior: exceed the cap rather than deadlock
   // Reject a chunk whose declared uncompressed size exceeds this (corruption /
   // decompression-bomb guard). 0 disables the check. Default 2 GiB: no legitimate
   // MCAP chunk approaches this.
@@ -410,26 +426,58 @@ private:
     scheduled_.assign(plans_.size(), false);
     futures_.resize(plans_.size());
 
-    // Memory cap: profile the (filtered) chunk set and resolve a byte budget.
-    const auto profile = computeResidencyProfile(chunkIndexes, selectedChannels_);
-    uint64_t lookahead = opts_.lookaheadBytes;
-    if (lookahead == 0) {
-      const unsigned t =
-        opts_.threadCount ? opts_.threadCount : std::thread::hardware_concurrency();
-      lookahead = uint64_t(std::max(1u, t)) * (profile.uMaxBytes ? profile.uMaxBytes : 1);
+    // ---- Memory back-pressure: ByteBudget (default) or ChunkCount (opt-in) ----
+    // Both reuse the same ByteSemaphore; the UNIT differs (bytes vs chunks, see
+    // scheduleChunk). REQUIRED frontier chunks use forceAcquire in either mode, so
+    // the k-way merge never deadlocks regardless of the cap.
+    if (opts_.memoryCap == MemoryCapMode::ChunkCount) {
+      // Cap the number of concurrently-live chunks. Use the TOTAL topic count (not
+      // the selected subset): a single-topic filtered read must still get ample
+      // prefetch depth, so the cap can't collapse to 2 just because one topic is
+      // selected. Default 2 * topics; overridable via opts.maxLiveChunks.
+      const unsigned numTopics = static_cast<unsigned>(reader_.channels().size());
+      const unsigned liveCap =
+        opts_.maxLiveChunks != 0 ? opts_.maxLiveChunks : std::max(2u * std::max(numTopics, 1u), 2u);
+      sem_ = std::make_shared<internal::ByteSemaphore>(static_cast<uint64_t>(liveCap));
+    } else {
+      // Precise byte budget: profile worst-case residency and resolve an effective
+      // byte cap (floor + lookahead). This is the portable hard memory ceiling.
+      const auto profile = computeResidencyProfile(chunkIndexes, selectedChannels_);
+      uint64_t lookahead = opts_.lookaheadBytes;
+      if (lookahead == 0) {
+        const unsigned t =
+          opts_.threadCount ? opts_.threadCount : std::thread::hardware_concurrency();
+        lookahead = uint64_t(std::max(1u, t)) * (profile.uMaxBytes ? profile.uMaxBytes : 1);
+      }
+      budget_ = resolveBudget(profile, opts_.read.readOrder, opts_.maxBytesInFlight,
+                              opts_.capPolicy, lookahead);
+      if (budget_.fallBackToSerial || !budget_.feasibleWithoutEviction) {
+        // Caller asked for a regime this engine won't honor silently. Surface it;
+        // the caller can fall back to McapReader::readMessages.
+        status_ = Status{StatusCode::InvalidMessageReadOptions, budget_.note};
+        onProblem_(status_);
+        return;
+      }
+      sem_ = std::make_shared<internal::ByteSemaphore>(
+        std::max<uint64_t>(budget_.effectiveBudgetBytes, 1));
     }
-    budget_ = resolveBudget(profile, opts_.read.readOrder, opts_.maxBytesInFlight, opts_.capPolicy,
-                            lookahead);
-    if (budget_.fallBackToSerial || !budget_.feasibleWithoutEviction) {
-      // Caller asked for a regime this engine won't honor silently. Surface it;
-      // the caller can fall back to McapReader::readMessages.
-      status_ = Status{StatusCode::InvalidMessageReadOptions, budget_.note};
-      onProblem_(status_);
-      return;
+    // Worker count: default 4 (most reads are consumer/merge-bound, where ~4
+    // decompressors keep the single consumer fed); HARD CAP 8 (decompression
+    // saturates memory bandwidth around there, so >8 only adds contention and
+    // regresses -- confirmed on both small-message and point-cloud workloads);
+    // never exceed the core count. An explicit threadCount overrides the default
+    // but is still capped at 8.
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) {
+      hw = 8;
     }
-    sem_ = std::make_shared<internal::ByteSemaphore>(
-      std::max<uint64_t>(budget_.effectiveBudgetBytes, 1));
-    pool_ = std::make_unique<internal::ThreadPool>(opts_.threadCount);
+    const unsigned cap = std::min(8u, hw);
+    unsigned workers = opts_.threadCount == 0 ? 4u : opts_.threadCount;
+    workers = std::min(workers, cap);
+    if (workers == 0) {
+      workers = 1;
+    }
+    pool_ = std::make_unique<internal::ThreadPool>(workers);
   }
 
   // Decompress + parse one chunk on a worker. `budgetHeld` was already acquired
@@ -563,7 +611,9 @@ private:
   // (prefetch) and return false if the budget is full.
   bool scheduleChunk(size_t planIdx, bool force) {
     if (scheduled_[planIdx]) return true;
-    const uint64_t need = plans_[planIdx].uncompressedSize;
+    const uint64_t need = opts_.memoryCap == MemoryCapMode::ChunkCount
+                            ? uint64_t{1}                        // one credit per chunk
+                            : plans_[planIdx].uncompressedSize;  // bytes for the byte budget
     if (force) {
       sem_->forceAcquire(need);
     } else if (!sem_->tryAcquire(need)) {

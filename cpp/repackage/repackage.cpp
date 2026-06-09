@@ -46,6 +46,7 @@ struct Options {
   mcap::Compression compression = mcap::Compression::Zstd;
   uint32_t compressionLevel = 0;
   bool includeCrc = true;
+  uint32_t readThreads = 0;  // 0 = hardware_concurrency() (parallel read path only)
 
   uint64_t windowNs() const {
     return windowDurationSecs * kNanosPerSecond;
@@ -76,6 +77,8 @@ void printUsage(const char* argv0) {
        "                                  CompressionLevel enum: 0/3=Default, 1=Fastest,\n"
        "                                  2=Fast, 4=Slow, >=5=Slowest (default: 0)\n"
        "    --include-crc[=<bool>]        Include CRCs in the output MCAP (default: true)\n"
+       "    --read-threads <n>            Parallel-read worker threads, 0 = all cores\n"
+       "                                  (default: 0; ignored on the serial fallback path)\n"
        "    -h, --help                    Print help\n";
 }
 
@@ -187,6 +190,12 @@ std::optional<Options> parseArgs(int argc, char** argv) {
       auto v = getValue(arg);
       if (!v || !parseUint32(*v, o.compressionLevel)) {
         std::cerr << "error: --compression-level expects a 32-bit non-negative integer\n";
+        return std::nullopt;
+      }
+    } else if (arg == "--read-threads") {
+      auto v = getValue(arg);
+      if (!v || !parseUint32(*v, o.readThreads)) {
+        std::cerr << "error: --read-threads expects a 32-bit non-negative integer\n";
         return std::nullopt;
       }
     } else if (arg == "--include-crc") {
@@ -724,6 +733,7 @@ int main(int argc, char** argv) {
   if (indexed) {
     mcap::ParallelReadOptions readOpts;
     readOpts.read.readOrder = mcap::ReadMessageOptions::ReadOrder::LogTimeOrder;
+    readOpts.threadCount = opts.readThreads;  // 0 -> hardware_concurrency()
     mcap::ParallelMessageView view = reader.readMessages(onProblem, readOpts);
     if (view.status().ok()) {
       for (const auto& mv : view) {

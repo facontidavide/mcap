@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mcap-repackage: rationale, algorithm and performance</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --accent: #0a5db8;
+    --bg: #fff;
+    --bg-alt: #f6f7f9;
+    --bg-code: #f0f2f5;
+    --border: #d8dde3;
+    --good: #1f7a3a;
+    --warn: #b06b00;
+  }
+  html { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; color: var(--fg); background: var(--bg); }
+  body { max-width: 920px; margin: 2rem auto; padding: 0 1.25rem; line-height: 1.55; }
+  h1 { font-size: 1.9rem; margin-top: 0; border-bottom: 2px solid var(--accent); padding-bottom: 0.35rem; }
+  h2 { font-size: 1.35rem; margin-top: 2.2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.2rem; }
+  h3 { font-size: 1.1rem; margin-top: 1.5rem; color: var(--accent); }
+  p, li { font-size: 0.98rem; }
+  ul, ol { padding-left: 1.4rem; }
+  code, pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.88rem; }
+  code { background: var(--bg-code); padding: 1px 4px; border-radius: 3px; }
+  pre { background: var(--bg-code); padding: 0.8rem 1rem; border-radius: 6px; overflow-x: auto; line-height: 1.4; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0.8rem 0 1.2rem; font-size: 0.92rem; }
+  th, td { border: 1px solid var(--border); padding: 0.45rem 0.7rem; text-align: left; }
+  th { background: var(--bg-alt); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .meta { color: var(--muted); font-size: 0.88rem; margin-top: -0.5rem; }
+  .note { background: var(--bg-alt); border-left: 3px solid var(--accent); padding: 0.6rem 0.9rem; margin: 0.9rem 0; border-radius: 0 4px 4px 0; }
+  .warn { background: #fff7e6; border-left: 3px solid var(--warn); padding: 0.6rem 0.9rem; margin: 0.9rem 0; border-radius: 0 4px 4px 0; }
+  .good { color: var(--good); font-weight: 600; }
+  figcaption { font-size: 0.85rem; color: var(--muted); margin-top: 0.3rem; }
+  .toc { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 1rem; margin: 1rem 0 2rem; }
+  .toc ol { margin: 0.3rem 0 0 1.2rem; padding: 0; }
+  .toc li { margin: 0.1rem 0; }
+  .ascii { font-family: "SF Mono", Menlo, Consolas, monospace; white-space: pre; background: var(--bg-code); padding: 0.9rem 1rem; border-radius: 6px; font-size: 0.84rem; line-height: 1.25; overflow-x: auto; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+</style>
+</head>
+<body>
+
+<h1>mcap-repackage: rationale, algorithm and performance</h1>
+<p class="meta">Re-chunking MCAP files for smaller size and faster reads. Built on the multithreaded <code>mcap::ParallelReader</code>.</p>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#why">Why repackage?</a></li>
+    <li><a href="#what">What the tool produces</a></li>
+    <li><a href="#algorithm">Algorithm (architectural view)</a></li>
+    <li><a href="#benchmark">Benchmark: dexory dataset</a></li>
+    <li><a href="#expect">When to expect a win &mdash; and when not</a></li>
+    <li><a href="#replicate">Replicating the algorithm</a></li>
+    <li><a href="#caveats">Caveats and library quirks</a></li>
+  </ol>
+</div>
+
+<h2 id="why">1. Why repackage?</h2>
+<p>
+An MCAP file is a sequence of records grouped into <em>chunks</em>. Each chunk is independently
+compressed (zstd or lz4) and is indexed by a <em>chunk index</em> (start time, end time, byte
+offset) plus, optionally, a per-channel <em>message index</em> for random access inside the chunk.
+The layout chosen by the <strong>writer</strong> &mdash; how messages are grouped into chunks, and
+in what order within each chunk &mdash; is a one-time decision that the reader cannot undo without
+rewriting the file.
+</p>
+<p>
+Most MCAP writers (including <code>rosbag2</code>, the canonical ROS&nbsp;2 recorder) chunk
+messages in <strong>arrival order</strong>. Inside a single chunk you therefore find an interleaved
+soup of all topics that were active during that time slice. That is the natural thing to do while
+recording, but it has two costs that a downstream consumer pays forever:
+</p>
+<ol>
+  <li>
+    <strong>Compression ratio.</strong>
+    zstd compresses by finding repetition within a sliding window (typically tens of KiB to a few
+    MiB). When messages from one topic &mdash; same field layout, same repeated frame_ids,
+    same enum constants &mdash; are interleaved with unrelated messages from 100+ other topics, the
+    repetition is dispersed and the window keeps churning. Co-locating same-topic messages packs
+    that repetition into a small region zstd can exploit fully.
+  </li>
+  <li>
+    <strong>Chunk geometry.</strong>
+    Recorders tend to emit small chunks to keep memory bounded and to flush often. The result is
+    hundreds of small chunks per file, each with its own index. Random-access reads pay per-chunk
+    overhead (index lookup, decompressor setup, partial decode), and the parallel reader has fewer
+    independent units to pipeline across cores.
+  </li>
+</ol>
+
+<p>
+<code>mcap-repackage</code> rewrites the chunk layout to remove both costs without altering
+message content, message order in log-time, or any metadata. The output is a fully valid,
+fully indexed MCAP file that any conforming reader will accept.
+</p>
+
+<h2 id="what">2. What the tool produces</h2>
+<p>
+A repackaged file has the same messages, channels, schemas, attachments, metadata, profile, and
+library string as the input, but its chunks are different in three concrete ways:
+</p>
+<ol>
+  <li>
+    <strong>Time-disjoint chunks.</strong>
+    Messages are read in log-time order and packed into a buffer until the buffer reaches the
+    target <code>--chunk-size</code> (default 4 MiB uncompressed). Each chunk therefore spans
+    a contiguous slice of log time and chunks do not overlap. A log-time read needs no cross-chunk
+    merge: it can stream chunks in file order.
+  </li>
+  <li>
+    <strong>Topic-adjacent within a chunk.</strong>
+    Before writing, the buffer is stable-sorted by
+    <code>(channel_id, log_time, sequence)</code>. zstd sees long runs of same-topic payload
+    and compresses far more aggressively.
+  </li>
+  <li>
+    <strong>Large messages isolated.</strong>
+    Any message at or above <code>--large-message-threshold</code> (default 256 KiB) is written as
+    its own single-message chunk. This prevents one outsize payload &mdash; a point cloud, an
+    image &mdash; from forcing a selective reader to decompress hundreds of unrelated small messages
+    that share its chunk, and prevents it from poisoning the zstd window for the small messages.
+  </li>
+</ol>
+
+<div class="note">
+<strong>Important property &mdash; lossless w.r.t. message order.</strong>
+Because chunks are time-disjoint and messages within a chunk carry their original log-time, a
+log-time read of the repackaged file returns exactly the same sequence as a log-time read of the
+input. The within-chunk sort by channel is a layout optimisation, not a re-ordering of the
+playback stream.
+</div>
+
+<h2 id="algorithm">3. Algorithm (architectural view)</h2>
+
+<h3>3.1 Pipeline</h3>
+<div class="ascii">
+       ┌──────────────────────────────────────────────────────────────┐
+       │                    INPUT MCAP (mmap'd)                       │
+       └──────────────────────────────────────────────────────────────┘
+                                  │
+              read summary (chunk + message indexes)
+                                  ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │      ParallelReader: thread pool decompresses ahead          │
+       │      (k-way merge across chunks in log-time order)           │
+       └──────────────────────────────────────────────────────────────┘
+                                  │  one message at a time, in log-time order
+                                  ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │  Repackager (single thread)                                  │
+       │    • re-register schema/channel on writer (first seen)       │
+       │    • if size ≥ large-threshold → flush, emit alone, flush    │
+       │    • else append to buffer; if buffer ≥ chunk-size → flush   │
+       │  flush:  stable_sort(buffer, by channel, log_time, sequence) │
+       │          for each msg: writer.write(msg)                     │
+       │          writer.closeLastChunk()                             │
+       └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │  McapWriter (zstd / lz4 / none)                              │
+       │  emits time-disjoint chunks + message indexes + summary      │
+       └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+       ┌──────────────────────────────────────────────────────────────┐
+       │  Copy metadata + attachments (original file order)           │
+       │  Write summary section + footer                              │
+       └──────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                          OUTPUT MCAP
+</div>
+
+<h3>3.2 The three data-flow rules</h3>
+<p>
+Every decision in the Repackager comes from three rules. They are deliberately simple, because
+the time-disjoint property follows automatically when messages arrive in log-time order:
+</p>
+
+<table>
+  <thead>
+    <tr><th>Rule</th><th>Trigger</th><th>Action</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>R1 &mdash; isolate large</td>
+      <td><code>msg.dataSize ≥ largeMessageThreshold</code></td>
+      <td>Flush current buffer, emit the large message alone, close its chunk.</td>
+    </tr>
+    <tr>
+      <td>R2 &mdash; size-bounded flush</td>
+      <td><code>buffer_payload + msg.dataSize &gt; chunkSize</code> (and buffer is non-empty)</td>
+      <td>Flush current buffer, then append the message to a fresh buffer.</td>
+    </tr>
+    <tr>
+      <td>R3 &mdash; ordinary append</td>
+      <td>otherwise</td>
+      <td>Append message to the buffer.</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>
+&ldquo;Flush&rdquo; means: stable-sort the buffered messages by
+<code>(channel_id, log_time, sequence)</code>, write them sequentially through the
+<code>McapWriter</code>, then call <code>closeLastChunk()</code>. The sort is stable so messages
+that share a channel keep their log-time order, and ties on log-time fall back to the original
+sequence number. Because every message in the buffer was appended in log-time order, the buffer
+holds a contiguous time window <em>before</em> sorting; sorting by channel re-orders inside that
+window but the window&rsquo;s [start, end] times are unchanged. The next chunk&rsquo;s window starts
+at or after the previous chunk&rsquo;s end &mdash; chunks are time-disjoint by construction.
+</p>
+
+<h3>3.3 Read path: parallel when possible, serial fallback</h3>
+<p>
+The read side picks between two paths based on what indexes the input has:
+</p>
+<ul>
+  <li>
+    <strong>ParallelReader</strong> when every chunk has a message index (or at least one does).
+    Workers in a fixed-size thread pool prefetch and decompress chunks ahead of the consumer; a
+    bounded byte-semaphore caps how many decompressed chunks are resident at once
+    (<code>memoryCap</code> mode <code>ChunkCount</code> is used for the repackager, which is
+    neutral-to-faster for a full sequential read).
+  </li>
+  <li>
+    <strong>Serial fallback</strong> for unchunked files, or chunked files with no message
+    indexes. The serial path assumes the input is approximately log-time ordered (which is how
+    every common recorder writes).
+  </li>
+</ul>
+
+<h3>3.4 Why time-disjointness is the load-bearing property</h3>
+<p>
+Most chunk-layout proposals in MCAP-adjacent tools either (a) sort the whole file by topic, or
+(b) interleave chunks freely and trust the reader to k-way merge them. The
+<em>time-disjoint, topic-adjacent-within-chunk</em> layout is a deliberate middle ground:
+</p>
+<ul>
+  <li>
+    A reader that wants <strong>all messages in log-time order</strong> streams chunks in file
+    order with no merge &mdash; one decompressor, one cursor.
+  </li>
+  <li>
+    A reader that wants <strong>only some topics</strong> uses the per-chunk message indexes; it
+    still touches every chunk that overlaps the time range, but each chunk yields its
+    topic-of-interest messages contiguously after decompression (better cache behaviour and a
+    smaller decompressed payload because the chunk itself is smaller).
+  </li>
+  <li>
+    A reader that wants a <strong>time window</strong> skips every chunk whose
+    [start, end] is outside the window. With time-disjoint chunks there is no false positive,
+    so the smallest possible set of chunks is decompressed.
+  </li>
+</ul>
+
+<h2 id="benchmark">4. Benchmark: dexory dataset</h2>
+
+<p>
+Two representative recordings from the <code>~/ws_plotjuggler/DATA/dexory</code> set
+(<code>197_continuous_*.mcap</code>, <code>200_continuous_*.mcap</code>): ROS&nbsp;2 bags, 20&nbsp;min
+each, ~84 MB compressed on disk, ~357 MiB uncompressed payload, 1.28&nbsp;M messages across
+162 topics, 481 chunks each. <code>/tf</code> is the per-experiment small target: ~90,000 messages
+at 75&nbsp;Hz, ~33 MiB of payload (~10 % of total), one of ~160 active topics.
+</p>
+
+<p>
+Hardware: local NVMe SSD; warm-cache runs follow a <code>cat file &gt; /dev/null</code>;
+cold-cache runs evict the file via <code>posix_fadvise(POSIX_FADV_DONTNEED)</code>.
+</p>
+
+<h3>4.1 File geometry: before vs after</h3>
+<table>
+  <thead>
+    <tr><th>Metric</th><th class="num">Original</th><th class="num">Repackaged</th><th class="num">Δ</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>File size on disk</td><td class="num">84 MB</td><td class="num">49 MB</td><td class="num good">&minus;42 %</td></tr>
+    <tr><td>Compressed payload (zstd)</td><td class="num">62.75 MiB</td><td class="num">28.13 MiB</td><td class="num good">&minus;55 %</td></tr>
+    <tr><td>Compression ratio</td><td class="num">82.42 %</td><td class="num">92.12 %</td><td class="num good">+9.7 pp</td></tr>
+    <tr><td>Chunk count</td><td class="num">481</td><td class="num">82</td><td class="num good">&minus;83 %</td></tr>
+    <tr><td>Max uncompressed chunk</td><td class="num">2.04 MiB</td><td class="num">4.54 MiB</td><td class="num">closer to 4 MiB target</td></tr>
+    <tr><td>Repack wall time</td><td class="num">&mdash;</td><td class="num">~1.0 s</td><td class="num">~84 MB/s end-to-end</td></tr>
+  </tbody>
+</table>
+<figcaption>Per-file numbers from file 197; file 200 reproduces the same totals to within 1 %.</figcaption>
+
+<h3>4.2 Read time: full file (1.28 M messages, all topics)</h3>
+<table>
+  <thead>
+    <tr><th>Mode</th><th class="num">Original</th><th class="num">Repackaged</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Serial, warm cache</td><td class="num">0.30 s</td><td class="num">0.31 s</td><td>Decompression-bound; bigger chunks = same total work</td></tr>
+    <tr><td>Parallel-4, warm cache</td><td class="num">0.14 s</td><td class="num">0.16 s</td><td>Already near-optimal on both</td></tr>
+    <tr><td>Parallel-8, warm cache</td><td class="num">0.14 s</td><td class="num">0.15 s</td><td>Diminishing returns on this small file</td></tr>
+  </tbody>
+</table>
+<p>
+A full read decompresses every chunk regardless of layout. The repackaged file has 55&nbsp;%
+less compressed payload but identical uncompressed payload, so when the input is already in
+RAM the limiting factor is zstd CPU and the numbers are nearly flat.
+</p>
+
+<h3>4.3 Read time: <code>/tf</code> only (~33 MiB of payload, 1 of 162 topics)</h3>
+<table>
+  <thead>
+    <tr><th>Mode</th><th class="num">Original</th><th class="num">Repackaged</th><th class="num">Speedup</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Serial, warm cache</td><td class="num">0.147 s</td><td class="num">0.131 s</td><td class="num">1.12&times;</td></tr>
+    <tr><td>Parallel-4, warm cache</td><td class="num">0.064 s</td><td class="num">0.060 s</td><td class="num">1.07&times;</td></tr>
+    <tr><td>Serial, cold cache</td><td class="num">0.165 s</td><td class="num">0.136 s</td><td class="num">1.21&times;</td></tr>
+    <tr><td>Parallel-4, cold cache</td><td class="num">0.084 s</td><td class="num">0.055 s</td><td class="num good">1.53&times;</td></tr>
+  </tbody>
+</table>
+<p>
+On cold cache the smaller file matters more: the repackaged file moves 42&nbsp;% less byte traffic
+from disk, and the parallel-4 reader pipelines that I/O against decompression effectively
+enough that the selective <code>/tf</code> read becomes 35&nbsp;% faster wall-clock. On a network
+filesystem or a slower disk the I/O gap would dominate the comparison further.
+</p>
+
+<h3>4.4 What this implies for production workloads</h3>
+<ul>
+  <li>
+    <strong>Storage cost.</strong> 42&nbsp;% smaller files on a representative ROS&nbsp;2 bag with
+    160+ topics. For a dataset measured in TB this is the first-order win.
+  </li>
+  <li>
+    <strong>Selective topic reads</strong> (the common case for analysis tools like
+    PlotJuggler) get faster proportionally to how much they were I/O-bound: marginal on warm
+    SSD, significant on cold or remote storage.
+  </li>
+  <li>
+    <strong>Full-bag replays</strong> (e.g. simulation) are decompression-bound and see modest or
+    no speedup &mdash; but they also do not regress.
+  </li>
+</ul>
+
+<h2 id="expect">5. When to expect a win &mdash; and when not</h2>
+
+<table>
+  <thead>
+    <tr><th>Input characteristic</th><th>Expected size reduction</th><th>Expected selective-read speedup</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Many topics, small chunks, ros2/rosbag2 recorder</td><td class="good">30&ndash;50 %</td><td>2&ndash;5&times; on cold cache (selective)</td></tr>
+    <tr><td>Few topics, large messages dominate (e.g. pure point clouds)</td><td>~0 %</td><td>~1&times; (selectivity already isolates them)</td></tr>
+    <tr><td>Already topic-sorted or single-topic chunks</td><td>~0 %</td><td>~1&times;</td></tr>
+    <tr><td>Uncompressed input</td><td>turns into compressed output (huge size win)</td><td>read time can regress if you stay compressed</td></tr>
+    <tr><td>Many small text/diagnostic topics (string-heavy)</td><td>often &gt; 50 %</td><td>large, because the compression ratio jumps the most</td></tr>
+  </tbody>
+</table>
+
+<div class="warn">
+<strong>When not to use it.</strong>
+The repackager is a batch tool. It loads chunks ahead, decompresses everything, and writes a
+new file &mdash; it is not appropriate for live recording, and it should not be run in the inner
+loop of an analysis pipeline. The expected use is &ldquo;archive once after a recording session,
+read many times afterward.&rdquo;
+</div>
+
+<h2 id="replicate">6. Replicating the algorithm</h2>
+
+<p>
+A second implementation in any language with an MCAP reader/writer needs the following pieces.
+None of them require touching the MCAP format itself; this is purely a re-layout of records.
+</p>
+
+<h3>6.1 Required reader capabilities</h3>
+<ol>
+  <li>
+    <strong>Log-time-ordered iteration</strong> over all messages, with per-message access to
+    <code>(channel_id, schema_id, log_time, publish_time, sequence, data, dataSize)</code> and to
+    the source channel + schema records.
+  </li>
+  <li>
+    <strong>Summary access</strong>: list of chunk indexes, message indexes, metadata indexes,
+    attachment indexes (to know what to copy through verbatim).
+  </li>
+  <li>
+    <strong>Random-access record reads</strong> at a byte offset (to copy attachment/metadata
+    bodies through without re-parsing).
+  </li>
+  <li>
+    Optional but recommended: a <strong>concurrent (mmap-backed) source</strong> so multiple
+    decompressor threads can read disjoint byte ranges in parallel. This is what the C++
+    <code>ParallelReader</code> requires of its source.
+  </li>
+</ol>
+
+<h3>6.2 Required writer capabilities</h3>
+<ol>
+  <li>
+    <strong>Explicit chunk boundary control.</strong> The implementation MUST be able to force a
+    chunk close at a chosen message (called <code>closeLastChunk()</code> in libmcap C++).
+    Without this you cannot implement size-bounded flushes or large-message isolation.
+  </li>
+  <li>
+    <strong>Per-message append</strong> into the current open chunk
+    (<code>write(Message)</code>), with the writer maintaining its own message index for that
+    chunk.
+  </li>
+  <li>
+    <strong>Schema and channel registration</strong> with writer-assigned IDs. The
+    repackager keeps two maps: <em>input schema id &rarr; output schema id</em> and
+    <em>input channel id &rarr; output channel id</em>, populated the first time each input ID is
+    seen.
+  </li>
+  <li>
+    <strong>Compression configuration</strong> (zstd / lz4 / none, level, CRC on/off).
+  </li>
+  <li>
+    <strong>Verbatim attachment + metadata write.</strong> The implementation must accept the
+    raw bytes of an attachment and the raw key/value pairs of a metadata record, so the output
+    is byte-identical with the input for those records.
+  </li>
+</ol>
+
+<h3>6.3 Algorithm skeleton</h3>
+<pre><code>open(input_path)             # mmap if the reader supports concurrent reads
+read_summary(input)
+configure writer:
+    profile = input.header.profile
+    library = input.header.library
+    chunk_size_target = chunkSize     # user option, default 4 MiB
+    compression       = zstd|lz4|none # user option, default zstd
+    compression_level = ...           # default = compressor default
+    chunk_buffer_reserve = max(256 MiB, chunkSize, largeMessageThreshold)
+                                      # clamped to a safe ceiling (2 GiB)
+open output stream(output_path)
+
+schema_map  := {}   # input_schema_id  -> output_schema_id
+channel_map := {}   # input_channel_id -> output_channel_id
+
+buffer       := []  # messages pending in the current chunk
+buffer_bytes := 0
+
+for msg in reader.read_messages(LogTimeOrder, on_problem):
+    cid_out := ensure_channel(writer, msg.channel, msg.schema, schema_map, channel_map)
+
+    if msg.dataSize >= largeMessageThreshold:
+        flush(buffer)                       # close current chunk (sort+write+close)
+        writer.close_last_chunk()           # idempotent if empty
+        writer.write(Message{cid_out, ...,  # emit isolated
+                             data, dataSize})
+        writer.close_last_chunk()           # large-message chunk closes immediately
+        continue
+
+    if buffer_bytes &gt; 0 and buffer_bytes + msg.dataSize &gt; chunk_size_target:
+        flush(buffer)
+
+    buffer.append((cid_out, msg.sequence, msg.logTime, msg.publishTime, copy(msg.data)))
+    buffer_bytes += msg.dataSize
+
+flush(buffer)                               # final chunk
+
+copy_metadata_and_attachments(reader, writer)   # in original file order
+writer.close()
+</code></pre>
+
+<p>where <code>flush</code> is:</p>
+
+<pre><code>function flush(buffer):
+    if buffer empty: return
+    stable_sort(buffer, key = (channel_id, log_time, sequence))
+    for m in buffer:
+        writer.write(Message{...})
+    buffer.clear()
+    buffer_bytes := 0
+    writer.close_last_chunk()
+</code></pre>
+
+<h3>6.4 Channel/schema re-registration</h3>
+<p>
+A channel is registered exactly once per output writer; reusing it for subsequent messages keeps
+the channel-id space small and matches what the input had. If the input channel references a
+schema id that the input never declared (corrupt input), fail fast and abort &mdash; do not silently
+write a schema-less channel.
+</p>
+
+<pre><code>function ensure_channel(writer, ch_in, sch_in, schema_map, channel_map):
+    if ch_in.id in channel_map: return channel_map[ch_in.id]
+
+    sch_out_id := 0
+    if ch_in.schema_id != 0:
+        if sch_in is null:
+            abort("channel references missing schema")
+        if ch_in.schema_id not in schema_map:
+            sch_out := Schema(sch_in.name, sch_in.encoding, sch_in.data)
+            writer.add_schema(sch_out)             # writer assigns sch_out.id
+            schema_map[ch_in.schema_id] := sch_out.id
+        sch_out_id := schema_map[ch_in.schema_id]
+
+    ch_out := Channel(ch_in.topic, ch_in.encoding, sch_out_id, ch_in.metadata)
+    writer.add_channel(ch_out)                     # writer assigns ch_out.id
+    channel_map[ch_in.id] := ch_out.id
+    return ch_out.id
+</code></pre>
+
+<h3>6.5 Metadata and attachments</h3>
+<p>
+Walk the reader&rsquo;s metadata-index and attachment-index lists, sort by file offset (so the
+output preserves their original order), read each record raw, parse just enough to extract the
+fields the writer needs (name, key/value pairs, or raw bytes), and call the writer&rsquo;s metadata
+/ attachment write methods. If the summary indexes are missing or visibly incomplete (count
+mismatch against statistics), fall back to a forced scan of the file to rebuild them &mdash;
+otherwise an output would silently lose records.
+</p>
+
+<h3>6.6 Optional: parallel decompression</h3>
+<p>
+The repackaging algorithm itself is single-threaded by construction (one ordered consumer). The
+read side, however, parallelises trivially because every chunk is independently
+decompressible. A useful pattern (used by the C++ <code>ParallelReader</code>):
+</p>
+<ul>
+  <li>
+    A fixed-size worker pool decompresses chunks ahead of the consumer.
+  </li>
+  <li>
+    A bounded byte-budget (<em>back-pressure semaphore</em>) caps resident decompressed bytes so
+    a fast pool does not exhaust memory ahead of a slow consumer.
+  </li>
+  <li>
+    A <em>k-way merge heap</em> over the chunks&rsquo; per-channel message indexes yields messages
+    in log-time order. Each chunk is decompressed at most once; cursors keep a shared pointer
+    pinning their chunk so it survives until the cursor drains.
+  </li>
+</ul>
+<p>
+This pattern accelerates the read step by ~2&times; with 4 threads on a typical workstation; for
+the dexory full read, repackaged file: 0.31 s serial &rarr; 0.16 s parallel-4 (warm cache). It
+does not change the output of the repackager; correctness is identical to the serial path.
+</p>
+
+<h2 id="caveats">7. Caveats and library quirks</h2>
+
+<ul>
+  <li>
+    <strong>Chunk-size ceiling.</strong> The libmcap C++ writer&rsquo;s chunk buffer is reserved
+    to its configured <code>chunkSize</code>, so the repackager picks a ceiling that is at least
+    as large as the target chunk size and the large-message threshold, clamped to 2 GiB. A
+    <code>--chunk-size</code> above that cap, or pathologically tiny messages, may add a benign
+    extra chunk boundary at the ceiling &mdash; never data loss. The default 4 MiB is well within
+    the cap.
+  </li>
+  <li>
+    <strong>Compression-level mapping.</strong> The C++ writer exposes only five levels via
+    <code>CompressionLevel</code>: Fastest=1, Fast=3, Default=1, Slow=5, Slowest=7. Level 0 is
+    treated as Default (zstd 1). zstd 1 is the recommended default: with parallel decompression
+    the read-time cost of a higher level is hidden, while the on-disk size gain plateaus quickly.
+  </li>
+  <li>
+    <strong>Unindexed inputs.</strong> A chunked input that has chunk indexes but no message
+    indexes cannot be read in log-time order by libmcap C++ &mdash; the tool falls back to file
+    order, which assumes the input is approximately log-time ordered (true for every common
+    recorder). The Rust reader, by contrast, re-derives order by decoding chunks; a port using the
+    Rust reader would not need this caveat.
+  </li>
+  <li>
+    <strong>Error policy.</strong> Any read problem surfaced via the reader&rsquo;s problem
+    callback (truncated record, decompression failure, missing channel) is fatal: the writer is
+    terminated and no output is produced. This matches what <code>rust/cli mcap convert</code>
+    does and is the only safe behaviour when the output is meant to replace the input.
+  </li>
+</ul>
+
+<hr>
+
+<p class="meta">
+Source: <code>cpp/repackage/repackage.cpp</code> on branch <code>feature/repackage-cpp</code>.
+Benchmark harness: <code>/tmp/repackage-build/bench.cpp</code> (links <code>mcap</code>,
+<code>zstd</code>, <code>lz4</code>, <code>pthread</code>; iterates messages once with and without
+a topic filter).
+Dataset: <code>~/ws_plotjuggler/DATA/dexory/197_continuous_2026_06_01-04_43_33.mcap</code> and
+<code>200_continuous_2026_06_01-05_43_33.mcap</code>; both 84 MB, 1.28 M messages, 162 topics.
+</p>
+
+</body>
+</html>
